@@ -23,16 +23,22 @@ class GitLabSource:
         state: str = "opened",
         labels: list[str] | None = None,
         limit: int = 100,
+        page: int = 1,
     ) -> list[Issue]:
         """List issues from the project."""
         cmd = [
             "glab", "issue", "list",
             "--repo", self.repo,
             "--per-page", str(limit),
+            "--page", str(page),
             "--output", "json",
         ]
         if state:
-            cmd.extend(["--state", state])
+            if state == "closed":
+                cmd.append("--closed")
+            elif state == "all":
+                cmd.append("--all")
+            # "opened" is the default when --closed is not used
         if labels:
             cmd.extend(["--label", ",".join(labels)])
 
