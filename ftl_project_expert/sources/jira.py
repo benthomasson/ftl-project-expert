@@ -84,7 +84,12 @@ class JiraSource:
         if jql is None:
             parts = [f'project = "{self.project}"']
             if state:
-                parts.append(f'statusCategory = "{state}"')
+                if state.lower() in ("open", "opened"):
+                    parts.append('statusCategory != "Done"')
+                elif state.lower() in ("closed", "done"):
+                    parts.append('statusCategory = "Done"')
+                else:
+                    parts.append(f'statusCategory = "{state}"')
             if labels:
                 label_clause = " AND ".join(f'labels = "{l}"' for l in labels)
                 parts.append(f"({label_clause})")

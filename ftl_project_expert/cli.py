@@ -291,9 +291,12 @@ def scan(ctx, state, labels, limit, page, all_pages, jql):
 
     # Set default state per platform
     if state is None:
-        state = "opened" if config["platform"] == "gitlab" else "open"
-        if config["platform"] == "jira":
-            state = None  # Jira uses JQL
+        if config["platform"] == "gitlab":
+            state = "opened"
+        elif config["platform"] == "jira":
+            state = "open"  # maps to statusCategory != "Done" in JQL
+        else:
+            state = "open"
 
     if all_pages:
         current_page = 1
