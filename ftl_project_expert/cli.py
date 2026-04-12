@@ -17,6 +17,7 @@ from .prompts import (
     PROPOSE_BELIEFS_PROJECT,
     build_explore_prompt,
     build_scan_prompt,
+    build_summary_prompt,
 )
 from .sources import GitHubSource, GitLabSource, Issue, JiraSource
 from .topics import (
@@ -259,11 +260,15 @@ def init(platform, target, domain, jira_url):
 @click.option("--labels", "-l", default=None,
               help="Comma-separated labels to filter by")
 @click.option("--limit", default=100, type=int,
-              help="Max issues to fetch (default: 100)")
+              help="Max issues per page (default: 100)")
+@click.option("--page", default=1, type=int,
+              help="Page number for pagination (default: 1)")
+@click.option("--all-pages", is_flag=True, default=False,
+              help="Auto-paginate through all issues (uses --limit as page size)")
 @click.option("--jql", default=None,
               help="Custom JQL query (Jira only)")
 @click.pass_context
-def scan(ctx, state, labels, limit, jql):
+def scan(ctx, state, labels, limit, page, all_pages, jql):
     """Scan project issues and create an overview."""
     config = _load_config()
     if not config:
@@ -278,8 +283,6 @@ def scan(ctx, state, labels, limit, jql):
         click.echo(f"Error: Model '{model}' CLI not available", err=True)
         sys.exit(1)
 
-    click.echo(f"Scanning {config.get('repo', config.get('project'))}...", err=True)
-
     source = _get_source(config)
     label_list = [l.strip() for l in labels.split(",") if l.strip()] if labels else None
 
@@ -289,9 +292,46 @@ def scan(ctx, state, labels, limit, jql):
         if config["platform"] == "jira":
             state = None  # Jira uses JQL
 
+    if all_pages:
+        current_page = 1
+        total_scanned = 0
+        while True:
+            click.echo(f"\n{'=' * 40}", err=True)
+            click.echo(f"Page {current_page}", err=True)
+            click.echo(f"{'=' * 40}", err=True)
+            count = _scan_page(
+                ctx, config, source, model, timeout, project_dir,
+                state, label_list, limit, current_page, jql,
+            )
+            if count == 0:
+                if total_scanned == 0:
+                    click.echo("No issues found.")
+                else:
+                    click.echo(f"\nDone. Scanned {total_scanned} issues across {current_page - 1} pages.", err=True)
+                break
+            total_scanned += count
+            if count < limit:
+                click.echo(f"\nDone. Scanned {total_scanned} issues across {current_page} pages.", err=True)
+                break
+            current_page += 1
+    else:
+        _scan_page(
+            ctx, config, source, model, timeout, project_dir,
+            state, label_list, limit, page, jql,
+        )
+
+
+def _scan_page(ctx, config, source, model, timeout, project_dir,
+               state, label_list, limit, page, jql):
+    """Scan a single page of issues. Returns the number of issues fetched."""
+    project_name = config.get("repo", config.get("project", "unknown"))
+    click.echo(f"Scanning {project_name} (page {page})...", err=True)
+
     try:
         if config["platform"] == "jira":
             issues = source.list_issues(jql=jql, state=state, labels=label_list, limit=limit)
+        elif config["platform"] == "gitlab":
+            issues = source.list_issues(state=state, labels=label_list, limit=limit, page=page)
         else:
             issues = source.list_issues(state=state, labels=label_list, limit=limit)
     except Exception as e:
@@ -299,20 +339,34 @@ def scan(ctx, state, labels, limit, jql):
         sys.exit(1)
 
     if not issues:
-        click.echo("No issues found.")
-        return
+        return 0
 
     click.echo(f"Fetched {len(issues)} issues", err=True)
 
+    # Fetch PRs for platforms that support them
+    prs = []
+    if config["platform"] in ("github", "gitlab") and hasattr(source, "list_prs"):
+        try:
+            prs = source.list_prs(state=state or "open", limit=limit)
+            if prs:
+                click.echo(f"Fetched {len(prs)} pull requests", err=True)
+        except Exception as e:
+            click.echo(f"Warning: Could not fetch PRs: {e}", err=True)
+
     # Build prompt
     issues_text = "\n\n".join(issue.to_prompt_text() for issue in issues)
-    project_name = config.get("repo", config.get("project", "unknown"))
+    prs_text = ""
+    if prs:
+        prs_text = "\n\n".join(pr.to_prompt_text() for pr in prs)
 
     prompt = build_scan_prompt(
         issues_text=issues_text,
+        prs_text=prs_text,
         project_name=project_name,
         platform=config["platform"],
         issue_count=len(issues),
+        pr_count=len(prs),
+        state=state,
     )
 
     click.echo(f"Running {model}...", err=True)
@@ -322,8 +376,12 @@ def scan(ctx, state, labels, limit, jql):
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    safe_name = project_name.replace("/", "-")
-    _create_entry(f"scan-{safe_name}", f"Scan: {project_name}", result)
+    # Strip URL prefix for entry naming
+    short_name = project_name.split("//")[-1] if "//" in project_name else project_name
+    safe_name = short_name.replace("/", "-")
+    state_suffix = f"-{state}" if state and state not in ("open", "opened") else ""
+    page_suffix = f"-p{page}" if page > 1 else ""
+    _create_entry(f"scan-{safe_name}{state_suffix}{page_suffix}", f"Scan: {project_name} ({state or 'open'}, page {page})", result)
     _enqueue_topics(result, source=f"scan:{project_name}", project_dir=project_dir)
     _report_beliefs(result)
 
@@ -331,6 +389,7 @@ def scan(ctx, state, labels, limit, jql):
     _cache_issues(issues, project_dir)
 
     _emit(ctx, result)
+    return len(issues)
 
 
 def _cache_issues(issues: list[Issue], project_dir: str) -> None:
@@ -753,6 +812,325 @@ def accept_beliefs(proposals_file):
             sys.exit(1)
 
     click.echo(f"\nAccepted {added} beliefs")
+
+
+# --- derive ---
+
+
+def _load_network() -> dict:
+    """Load network.json (exported from reasons)."""
+    network_path = Path("network.json")
+    if not network_path.exists():
+        if _has_reasons():
+            result = subprocess.run(
+                ["reasons", "export"], capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                return json.loads(result.stdout)
+        return {"nodes": {}}
+    return json.loads(network_path.read_text())
+
+
+def _get_depth(node_id: str, nodes: dict, derived: dict, memo: dict | None = None) -> int:
+    """Compute the depth of a node in the reasoning chain."""
+    if memo is None:
+        memo = {}
+    if node_id in memo:
+        return memo[node_id]
+    if node_id not in derived:
+        memo[node_id] = 0
+        return 0
+    max_d = 0
+    for j in derived[node_id].get("justifications", []):
+        for a in j.get("antecedents", []):
+            max_d = max(max_d, _get_depth(a, nodes, derived, memo))
+    memo[node_id] = max_d + 1
+    return max_d + 1
+
+
+def _build_beliefs_section(nodes: dict, derived: dict, max_beliefs: int = 300) -> str:
+    """Build a compact beliefs section for the derive prompt."""
+    from collections import defaultdict
+    lines = []
+    in_nodes = {k: v for k, v in nodes.items()
+                if v.get("truth_value") == "IN" and k not in derived}
+    groups = defaultdict(list)
+    for k, v in in_nodes.items():
+        prefix = k.split("-")[0] if "-" in k else k
+        groups[prefix].append((k, v["text"][:120]))
+
+    count = 0
+    for prefix in sorted(groups, key=lambda p: -len(groups[p])):
+        if count >= max_beliefs:
+            break
+        lines.append(f"\n### {prefix} ({len(groups[prefix])} beliefs)")
+        for belief_id, text in sorted(groups[prefix]):
+            if count >= max_beliefs:
+                break
+            lines.append(f"- `{belief_id}`: {text}")
+            count += 1
+
+    return "\n".join(lines)
+
+
+def _build_derived_section(nodes: dict, derived: dict) -> str:
+    """Build the derived conclusions section for the derive prompt."""
+    memo = {}
+    lines = []
+    for k in sorted(derived, key=lambda x: -_get_depth(x, nodes, derived, memo)):
+        depth = _get_depth(k, nodes, derived, memo)
+        text = nodes[k]["text"][:150]
+        justs = derived[k]["justifications"]
+        antes = justs[0].get("antecedents", []) if justs else []
+        outlist = justs[0].get("outlist", []) if justs else []
+        status = nodes[k].get("truth_value", "?")
+
+        lines.append(f"\n#### [{status}] depth-{depth}: `{k}`")
+        lines.append(text)
+        lines.append(f"- Antecedents: {', '.join(antes)}")
+        if outlist:
+            lines.append(f"- Unless: {', '.join(outlist)}")
+
+    return "\n".join(lines) if lines else "(No derived conclusions yet)"
+
+
+def _parse_derive_proposals(response: str) -> list[dict]:
+    """Parse DERIVE and GATE proposals from LLM response."""
+    proposals = []
+    pattern = re.compile(
+        r"### (DERIVE|GATE) (\S+)\n"
+        r"(.+?)\n"
+        r"- Antecedents: (.+?)\n"
+        r"(?:- Unless: (.+?)\n)?"
+        r"- Label: (.+?)(?:\n|$)",
+    )
+    for match in pattern.finditer(response):
+        kind = match.group(1)
+        proposal = {
+            "kind": kind.lower(),
+            "id": match.group(2).strip("`"),
+            "text": match.group(3).strip(),
+            "antecedents": [a.strip().strip("`") for a in match.group(4).split(",")],
+            "unless": [u.strip().strip("`") for u in match.group(5).split(",")] if match.group(5) else [],
+            "label": match.group(6).strip(),
+        }
+        proposals.append(proposal)
+    return proposals
+
+
+@cli.command("derive")
+@click.option("--output", "-o", default="proposed-derivations.md",
+              help="Output file (default: proposed-derivations.md)")
+@click.option("--auto", "auto_add", is_flag=True, default=False,
+              help="Automatically add proposals to reasons (no review step)")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Show what would be sent to the LLM without invoking it")
+@click.pass_context
+def derive(ctx, output, auto_add, dry_run):
+    """Derive deeper reasoning chains from existing beliefs.
+
+    Analyzes the belief network for opportunities to combine existing
+    conclusions into higher-level project claims, and to connect positive
+    and negative chains via outlist semantics.
+
+    Example:
+        project-expert derive              # propose derivations
+        project-expert derive --auto       # propose and add automatically
+    """
+    from .prompts.derive import DERIVE_BELIEFS_PROMPT
+
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
+    if not _has_reasons():
+        click.echo("Error: reasons CLI required. Install with: uv tool install ftl-reasons", err=True)
+        sys.exit(1)
+
+    # Load network
+    network = _load_network()
+    nodes = network.get("nodes", {})
+    if not nodes:
+        click.echo("No beliefs found. Run explorations first.", err=True)
+        sys.exit(1)
+
+    derived = {k: v for k, v in nodes.items()
+               if v.get("justifications") and len(v["justifications"]) > 0}
+    in_nodes = {k: v for k, v in nodes.items() if v.get("truth_value") == "IN"}
+    memo = {}
+    max_depth = max((_get_depth(k, nodes, derived, memo) for k in derived), default=0)
+
+    click.echo(f"Network: {len(in_nodes)} IN beliefs, {len(derived)} derived, max depth {max_depth}", err=True)
+
+    # Build prompt
+    beliefs_section = _build_beliefs_section(nodes, derived)
+    derived_section = _build_derived_section(nodes, derived)
+
+    prompt = DERIVE_BELIEFS_PROMPT.format(
+        beliefs_section=beliefs_section,
+        derived_section=derived_section,
+        total_in=len(in_nodes),
+        total_derived=len(derived),
+        max_depth=max_depth,
+    )
+
+    if dry_run:
+        click.echo(f"\n=== Prompt ({len(prompt)} chars) ===\n")
+        click.echo(prompt[:3000])
+        if len(prompt) > 3000:
+            click.echo(f"\n... ({len(prompt) - 3000} more chars)")
+        return
+
+    if not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
+    click.echo(f"Deriving with {model}...", err=True)
+    try:
+        result = asyncio.run(invoke(prompt, model, timeout=timeout))
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    # Parse proposals
+    proposals = _parse_derive_proposals(result)
+
+    if not proposals:
+        click.echo("No derivation proposals found in response.")
+        click.echo("\nRaw response:\n")
+        click.echo(result)
+        return
+
+    # Validate proposals — check antecedents exist
+    valid = []
+    for p in proposals:
+        missing = [a for a in p["antecedents"] if a not in nodes]
+        missing_unless = [u for u in p["unless"] if u not in nodes]
+        if missing or missing_unless:
+            click.echo(f"  SKIP {p['id']}: missing nodes {missing + missing_unless}", err=True)
+            continue
+        if p["id"] in nodes:
+            click.echo(f"  SKIP {p['id']}: already exists", err=True)
+            continue
+        valid.append(p)
+
+    click.echo(f"\n{len(valid)} valid proposals ({len(proposals) - len(valid)} skipped)", err=True)
+
+    if not valid:
+        return
+
+    if auto_add:
+        added = 0
+        for p in valid:
+            cmd = [
+                "reasons", "add", p["id"], p["text"],
+                "--sl", ",".join(p["antecedents"]),
+                "--label", p["label"],
+            ]
+            if p["unless"]:
+                cmd.extend(["--unless", ",".join(p["unless"])])
+
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                status = "IN" if "IN" in r.stdout else "OUT"
+                click.echo(f"  Added {p['id']} [{status}]")
+                added += 1
+            else:
+                click.echo(f"  FAIL {p['id']}: {r.stderr.strip() or r.stdout.strip()}", err=True)
+
+        if added:
+            click.echo(f"\nAdded {added} derived beliefs.", err=True)
+            _reasons_export()
+        return
+
+    # Write proposals file for review
+    output_path = Path(output)
+    with output_path.open("w") as f:
+        f.write("# Proposed Derivations\n\n")
+        f.write("Review each proposal below. To accept, run:\n\n")
+        f.write("```bash\n")
+        for p in valid:
+            sl = ",".join(p["antecedents"])
+            cmd = f'reasons add {p["id"]} "{p["text"]}" --sl {sl}'
+            if p["unless"]:
+                cmd += f' --unless {",".join(p["unless"])}'
+            cmd += f' --label "{p["label"]}"'
+            f.write(f"{cmd}\n")
+        f.write("```\n\n---\n\n")
+
+        for p in valid:
+            kind_label = "DERIVE" if p["kind"] == "derive" else "GATE (outlist)"
+            f.write(f"### {kind_label}: `{p['id']}`\n\n")
+            f.write(f"{p['text']}\n\n")
+            f.write(f"- **Antecedents**: {', '.join(f'`{a}`' for a in p['antecedents'])}\n")
+            if p["unless"]:
+                f.write(f"- **Unless**: {', '.join(f'`{u}`' for u in p['unless'])}\n")
+            f.write(f"- **Label**: {p['label']}\n\n")
+
+    click.echo(f"\nWrote {output_path} ({len(valid)} proposals)")
+    click.echo("Review, then run the commands from the file to accept.")
+    click.echo("Or re-run with --auto to add automatically.")
+
+
+# --- summary ---
+
+
+@cli.command()
+@click.pass_context
+def summary(ctx):
+    """Synthesize a project summary from beliefs."""
+    config = _load_config()
+    if not config:
+        click.echo("Not initialized. Run: project-expert init <platform> <target>")
+        sys.exit(1)
+
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
+    if not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
+    # Read beliefs from reasons or beliefs.md
+    beliefs_text = ""
+    belief_count = 0
+
+    if _has_reasons() and Path("reasons.db").exists():
+        result = subprocess.run(["reasons", "list"], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            beliefs_text = result.stdout
+            belief_count = len([l for l in result.stdout.splitlines() if l.strip()])
+    elif Path("beliefs.md").exists():
+        beliefs_text = Path("beliefs.md").read_text()
+        belief_count = len(re.findall(r"^### \S+", beliefs_text, re.MULTILINE))
+
+    if not beliefs_text or belief_count == 0:
+        click.echo("No beliefs found. Run the pipeline first:")
+        click.echo("  project-expert scan")
+        click.echo("  project-expert propose-beliefs")
+        click.echo("  project-expert accept-beliefs")
+        sys.exit(1)
+
+    click.echo(f"Summarizing {belief_count} beliefs with {model}...", err=True)
+
+    project_name = config.get("repo", config.get("project", "unknown"))
+
+    prompt = build_summary_prompt(
+        beliefs_text=beliefs_text,
+        project_name=project_name,
+        belief_count=belief_count,
+    )
+
+    try:
+        result = asyncio.run(invoke(prompt, model, timeout=timeout))
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    short_name = project_name.split("//")[-1] if "//" in project_name else project_name
+    safe_name = short_name.replace("/", "-")
+    _create_entry(f"summary-{safe_name}", f"Summary: {project_name}", result)
+
+    _emit(ctx, result)
 
 
 # --- status ---
