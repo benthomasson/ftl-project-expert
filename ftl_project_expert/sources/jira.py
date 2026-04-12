@@ -68,6 +68,7 @@ class JiraSource:
         state: str | None = None,
         labels: list[str] | None = None,
         limit: int = 100,
+        page: int = 1,
     ) -> list[Issue]:
         """List issues from the project.
 
@@ -75,7 +76,8 @@ class JiraSource:
             jql: Custom JQL query. If not set, builds one from project/state/labels.
             state: Filter by status category (e.g., "To Do", "In Progress", "Done")
             labels: Filter by labels
-            limit: Max results
+            limit: Max results per page
+            page: Page number (1-based, converted to startAt for Jira API)
         """
         if jql is None:
             parts = [f'project = "{self.project}"']
@@ -93,9 +95,11 @@ class JiraSource:
         ]
 
         # Use POST /search/jql (Jira Cloud deprecated GET /search)
+        start_at = (page - 1) * limit
         data = self._post("search/jql", {
             "jql": jql,
             "maxResults": limit,
+            "startAt": start_at,
             "fields": fields,
         })
 

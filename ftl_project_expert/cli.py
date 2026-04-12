@@ -332,7 +332,7 @@ def _scan_page(ctx, config, source, model, timeout, project_dir,
 
     try:
         if config["platform"] == "jira":
-            issues = source.list_issues(jql=jql, state=state, labels=label_list, limit=limit)
+            issues = source.list_issues(jql=jql, state=state, labels=label_list, limit=limit, page=page)
         elif config["platform"] == "gitlab":
             issues = source.list_issues(state=state, labels=label_list, limit=limit, page=page)
         else:
