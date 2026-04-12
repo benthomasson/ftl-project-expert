@@ -30,6 +30,7 @@ class JiraSource:
         self.user = user or os.environ.get("JIRA_USER", "")
         self.token = token or os.environ.get("JIRA_TOKEN", "")
         self.platform = "jira"
+        self._next_page_token = None
 
         if not self.base_url:
             raise ValueError("JIRA_URL not set. Set env var or pass url=")
@@ -77,7 +78,8 @@ class JiraSource:
             state: Filter by status category (e.g., "To Do", "In Progress", "Done")
             labels: Filter by labels
             limit: Max results per page
-            page: Page number (1-based, converted to startAt for Jira API)
+            page: Page number (1-based). Uses cursor-based pagination internally;
+                  page 1 starts fresh, subsequent pages use stored cursor.
         """
         if jql is None:
             parts = [f'project = "{self.project}"']
@@ -94,14 +96,23 @@ class JiraSource:
             "created", "updated", "resolutiondate", "comment", "fixVersions",
         ]
 
-        # Use POST /search/jql (Jira Cloud deprecated GET /search)
-        start_at = (page - 1) * limit
-        data = self._post("search/jql", {
+        # Use POST /search/jql with cursor-based pagination
+        body: dict = {
             "jql": jql,
             "maxResults": limit,
-            "startAt": start_at,
             "fields": fields,
-        })
+        }
+
+        # Page 1 starts fresh; subsequent pages use the stored cursor
+        if page == 1:
+            self._next_page_token = None
+        if self._next_page_token:
+            body["nextPageToken"] = self._next_page_token
+
+        data = self._post("search/jql", body)
+
+        # Store cursor for next call
+        self._next_page_token = data.get("nextPageToken")
 
         return [self._normalize(raw) for raw in data.get("issues", [])]
 
