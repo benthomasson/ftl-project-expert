@@ -49,6 +49,19 @@ class JiraSource:
         resp.raise_for_status()
         return resp.json()
 
+    def _post(self, path: str, json_body: dict) -> dict:
+        """Make authenticated POST request to Jira API."""
+        url = f"{self.base_url}/rest/api/3/{path.lstrip('/')}"
+        resp = requests.post(
+            url,
+            json=json_body,
+            auth=(self.user, self.token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def list_issues(
         self,
         jql: str | None = None,
@@ -73,12 +86,17 @@ class JiraSource:
                 parts.append(f"({label_clause})")
             jql = " AND ".join(parts) + " ORDER BY updated DESC"
 
-        data = self._get("search", params={
+        fields = [
+            "summary", "description", "status", "labels", "assignee",
+            "reporter", "priority", "issuetype", "parent", "issuelinks",
+            "created", "updated", "resolutiondate", "comment", "fixVersions",
+        ]
+
+        # Use POST /search/jql (Jira Cloud deprecated GET /search)
+        data = self._post("search/jql", {
             "jql": jql,
             "maxResults": limit,
-            "fields": "summary,description,status,labels,assignee,reporter,"
-                      "priority,issuetype,parent,issuelinks,created,updated,"
-                      "resolutiondate,comment,fixVersions",
+            "fields": fields,
         })
 
         return [self._normalize(raw) for raw in data.get("issues", [])]
