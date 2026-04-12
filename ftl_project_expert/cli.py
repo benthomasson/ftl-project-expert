@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import click
@@ -83,16 +83,19 @@ def _emit(ctx, text: str) -> None:
 
 
 def _create_entry(topic: str, title: str, content: str) -> None:
+    # Add HHMM timestamp so multiple scans on the same day don't collide
+    timestamp = datetime.now().strftime("%H%M")
+    entry_name = f"{topic}-{timestamp}"
     try:
         result = subprocess.run(
-            ["entry", "create", topic, title, "--content", content],
+            ["entry", "create", entry_name, title, "--content", content],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
             click.echo(f"Entry: {result.stdout.strip()}", err=True)
         else:
             result = subprocess.run(
-                ["entry", "create", topic, title],
+                ["entry", "create", entry_name, title],
                 input=content,
                 capture_output=True, text=True,
             )
