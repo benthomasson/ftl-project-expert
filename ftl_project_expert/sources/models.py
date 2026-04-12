@@ -16,6 +16,85 @@ class IssueComment:
 
 
 @dataclass
+class PullRequest:
+    """Normalized pull request / merge request from any platform."""
+    # Identity
+    id: str              # e.g., "PR-10", "MR-42"
+    title: str
+    url: str
+    platform: str        # "github", "gitlab"
+
+    # Content
+    body: str = ""
+    state: str = ""      # "open", "merged", "closed"
+    labels: list[str] = field(default_factory=list)
+    author: str = ""
+    created: str = ""
+    updated: str = ""
+    merged: str = ""
+    merged_by: str = ""
+
+    # Relationships
+    linked_issues: list[str] = field(default_factory=list)  # issue IDs this PR closes/fixes
+
+    # Files
+    files: list[str] = field(default_factory=list)
+    additions: int = 0
+    deletions: int = 0
+    changed_files: int = 0
+
+    # Review
+    reviews: list[dict] = field(default_factory=list)  # [{author, state, body}]
+    comment_count: int = 0
+    comments: list[IssueComment] = field(default_factory=list)
+
+    # Raw data
+    raw: dict = field(default_factory=dict)
+
+    def to_prompt_text(self) -> str:
+        """Format PR for inclusion in an LLM prompt."""
+        lines = [
+            f"## {self.id}: {self.title}",
+            f"- URL: {self.url}",
+            f"- State: {self.state}",
+        ]
+        if self.author:
+            lines.append(f"- Author: {self.author}")
+        if self.labels:
+            lines.append(f"- Labels: {', '.join(self.labels)}")
+        if self.linked_issues:
+            lines.append(f"- Linked issues: {', '.join(self.linked_issues)}")
+        lines.append(f"- Created: {self.created}")
+        if self.merged:
+            lines.append(f"- Merged: {self.merged}")
+            if self.merged_by:
+                lines.append(f"- Merged by: {self.merged_by}")
+        lines.append(f"- Changed files: {self.changed_files} (+{self.additions}/-{self.deletions})")
+        if self.files:
+            test_files = [f for f in self.files if "test" in f.lower()]
+            src_files = [f for f in self.files if "test" not in f.lower()]
+            if src_files:
+                lines.append(f"- Source files: {', '.join(src_files)}")
+            if test_files:
+                lines.append(f"- Test files: {', '.join(test_files)}")
+        if self.reviews:
+            lines.append(f"\n### Reviews ({len(self.reviews)})\n")
+            for r in self.reviews[:10]:
+                lines.append(f"**{r.get('author', '?')}** [{r.get('state', '?')}]: {r.get('body', '')[:200]}")
+            if len(self.reviews) > 10:
+                lines.append(f"... and {len(self.reviews) - 10} more reviews")
+        if self.body:
+            lines.append(f"\n### Description\n\n{self.body}")
+        if self.comments:
+            lines.append(f"\n### Comments ({len(self.comments)})\n")
+            for c in self.comments[:10]:
+                lines.append(f"**{c.author}** ({c.created}):\n{c.body}\n")
+            if len(self.comments) > 10:
+                lines.append(f"... and {len(self.comments) - 10} more comments")
+        return "\n".join(lines)
+
+
+@dataclass
 class Issue:
     """Normalized issue from any platform."""
     # Identity
