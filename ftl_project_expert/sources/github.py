@@ -23,6 +23,7 @@ class GitHubSource:
         state: str = "open",
         labels: list[str] | None = None,
         limit: int = 100,
+        since: str | None = None,
     ) -> list[Issue]:
         """List issues from the repository."""
         cmd = [
@@ -36,6 +37,8 @@ class GitHubSource:
         if labels:
             for label in labels:
                 cmd.extend(["--label", label])
+        if since:
+            cmd.extend(["--search", f"updated:>={since}"])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -63,6 +66,7 @@ class GitHubSource:
         self,
         state: str = "open",
         limit: int = 100,
+        since: str | None = None,
     ) -> list[PullRequest]:
         """List pull requests from the repository."""
         # Map issue states to PR states
@@ -79,6 +83,8 @@ class GitHubSource:
                       "reviews,comments,closingIssuesReferences",
             "--limit", str(limit),
         ]
+        if since:
+            cmd.extend(["--search", f"updated:>={since}"])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:

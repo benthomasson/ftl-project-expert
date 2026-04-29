@@ -70,6 +70,7 @@ class JiraSource:
         labels: list[str] | None = None,
         limit: int = 100,
         page: int = 1,
+        since: str | None = None,
     ) -> list[Issue]:
         """List issues from the project.
 
@@ -80,6 +81,7 @@ class JiraSource:
             limit: Max results per page
             page: Page number (1-based). Uses cursor-based pagination internally;
                   page 1 starts fresh, subsequent pages use stored cursor.
+            since: Fetch issues updated on or after this date (YYYY-MM-DD).
         """
         if jql is None:
             parts = [f'project = "{self.project}"']
@@ -93,6 +95,8 @@ class JiraSource:
             if labels:
                 label_clause = " AND ".join(f'labels = "{l}"' for l in labels)
                 parts.append(f"({label_clause})")
+            if since:
+                parts.append(f'updated >= "{since}"')
             jql = " AND ".join(parts) + " ORDER BY updated DESC"
 
         fields = [
