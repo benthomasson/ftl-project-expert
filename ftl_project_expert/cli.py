@@ -913,110 +913,149 @@ def accept_beliefs(proposals_file):
 # --- review-proposals ---
 
 
-_ISSUE_ID_PATTERN = re.compile(r"\b(GH-\d+|GL-\d+|MR-\d+|PR-\d+|[A-Z][A-Z0-9]+-\d+)\b")
+_REVIEW_PROMPT = """\
+You are reviewing proposed beliefs extracted from a project analysis. Your job is to filter \
+out low-quality proposals that should NOT be added to the belief network.
 
-_OPEN_WORDS = re.compile(
-    r"\b(is open|remains open|still open|unresolved|is blocking|blocks|"
-    r"is the sole blocker|open blocker|preventing completion|not yet resolved|"
-    r"has no assignee|unassigned and open)\b",
-    re.IGNORECASE,
-)
+## Rejection Criteria
 
-_META_PATTERNS = re.compile(
-    r"\b(belief network|belief graph|node count|nodes in the|cascade analysis|"
-    r"retraction cascade|compaction|reason maintenance|knowledge base has|"
-    r"belief registry|network growth|navigation feature|belief system)\b",
-    re.IGNORECASE,
-)
+Reject a proposal if it matches ANY of these categories:
 
-_EPHEMERAL_PATTERNS = re.compile(
-    r"\b(as of \d{4}|currently \d+ (days?|weeks?|months?)|"
-    r"has been open for \d+|open for \d+ days|"
-    r"\d+ nodes as of|network has \d+ (nodes?|beliefs?))\b",
-    re.IGNORECASE,
-)
+1. **Stale** — References issues as open/blocking/unresolved when the issue state data shows \
+they are actually closed, done, or merged.
+2. **Factually false** — Claims something wasn't implemented when linked PRs exist, or makes \
+claims contradicted by the issue data provided.
+3. **Meta** — About the belief network itself, not the project. Examples: node counts, cascade \
+analyses, compaction strategies, retraction history, knowledge base statistics.
+4. **Duplicate** — Same claim already exists in the current beliefs (listed below), or is a \
+trivial rewording of an existing belief.
+5. **Ephemeral** — Point-in-time snapshots that expire immediately. Examples: "issue open N days", \
+"network has N nodes as of date", "currently N items in backlog" (specific counts that change daily).
+6. **Speculative** — Cascade risk analyses, estimates, editorial judgments about what "should" \
+happen, predictions. Not grounded in observable project facts.
 
-_SPECULATIVE_PATTERNS = re.compile(
-    r"\b(could lead to|might cause|may result in|should be|"
-    r"risk of|estimated|would likely|potentially|"
-    r"if not addressed|suggests that perhaps)\b",
-    re.IGNORECASE,
-)
+## What to KEEP
+
+Keep proposals that are:
+- Specific, verifiable factual claims about the project
+- Grounded in issue tracker data (references specific issues, teams, milestones)
+- Structural observations (dependency chains, ownership gaps, blocking relationships)
+- Durable enough to remain true for at least a week
+
+## Issue State Data
+
+{issue_state}
+
+## Existing Beliefs
+
+{existing_beliefs}
+
+## Proposals to Review
+
+{proposals}
+
+## Output Format
+
+For EACH proposal, output exactly one line:
+
+ACCEPT belief-id
+or
+REJECT belief-id reason-category: brief explanation
+
+Categories: stale, false, meta, duplicate, ephemeral, speculative
+
+Review every proposal — do not skip any. Output nothing else.
+"""
 
 
-def _review_proposal(
-    belief_id: str,
-    claim_text: str,
-    cached_issues: dict,
-    existing_nodes: dict,
-) -> tuple[bool, str | None]:
-    """Check a single proposal against rejection criteria.
+def _build_issue_state_section(cached_issues: dict) -> str:
+    """Build a compact issue state reference for the review prompt."""
+    if not cached_issues:
+        return "(No cached issue data available)"
+    lines = []
+    for issue_id, data in sorted(cached_issues.items()):
+        state = data.get("state", "unknown")
+        title = data.get("title", "")[:80]
+        lines.append(f"- {issue_id}: [{state}] {title}")
+    return "\n".join(lines)
 
-    Returns (reject, reason) — reject=True means the proposal should be marked REJECT.
-    """
-    # 1. Stale — references issues as open when they're closed
-    issue_refs = _ISSUE_ID_PATTERN.findall(claim_text)
-    if issue_refs and _OPEN_WORDS.search(claim_text):
-        for ref in issue_refs:
-            cached = cached_issues.get(ref)
-            if cached and cached.get("state") in ("closed", "done", "resolved", "merged"):
-                return True, f"stale: {ref} is {cached['state']}"
 
-    # 2. Meta — about the belief network itself
-    if _META_PATTERNS.search(claim_text):
-        return True, "meta: about belief network, not the project"
+def _build_existing_beliefs_section(nodes: dict) -> str:
+    """Build a compact existing beliefs reference for the review prompt."""
+    if not nodes:
+        return "(No existing beliefs)"
+    lines = []
+    for node_id, node in sorted(nodes.items()):
+        text = node.get("text", "")[:100]
+        tv = node.get("truth_value", "?")
+        lines.append(f"- `{node_id}` [{tv}]: {text}")
+    if len(lines) > 300:
+        lines = lines[:300]
+        lines.append(f"... and {len(nodes) - 300} more beliefs")
+    return "\n".join(lines)
 
-    # 3. Duplicate — belief ID already exists in network
-    if belief_id in existing_nodes:
-        return True, f"duplicate: {belief_id} already exists"
 
-    # 4. Duplicate — high word overlap with existing belief text
-    claim_words = set(claim_text.lower().split())
-    if len(claim_words) >= 4:
-        for node_id, node in existing_nodes.items():
-            node_text = node.get("text", "")
-            node_words = set(node_text.lower().split())
-            if not node_words:
-                continue
-            overlap = len(claim_words & node_words)
-            union = len(claim_words | node_words)
-            if union > 0 and overlap / union > 0.7:
-                return True, f"duplicate: overlaps with {node_id}"
+def _build_proposals_section(proposals: list[dict]) -> str:
+    """Format proposals for the review prompt."""
+    lines = []
+    for p in proposals:
+        lines.append(f"### {p['id']}")
+        lines.append(p["text"])
+        lines.append(f"- Source: {p['source']}")
+        lines.append("")
+    return "\n".join(lines)
 
-    # 5. Ephemeral — time-bound snapshots
-    if _EPHEMERAL_PATTERNS.search(claim_text):
-        return True, "ephemeral: time-bound snapshot"
 
-    # 6. Speculative — editorial/predictive language
-    if _SPECULATIVE_PATTERNS.search(claim_text):
-        return True, "speculative: predictive/editorial language"
-
-    return False, None
+def _parse_review_response(response: str) -> dict[str, tuple[bool, str | None]]:
+    """Parse LLM review response into accept/reject decisions."""
+    decisions = {}
+    for line in response.splitlines():
+        line = line.strip()
+        if line.startswith("ACCEPT "):
+            belief_id = line[7:].strip()
+            decisions[belief_id] = (False, None)
+        elif line.startswith("REJECT "):
+            rest = line[7:].strip()
+            parts = rest.split(" ", 1)
+            belief_id = parts[0]
+            reason = parts[1] if len(parts) > 1 else "rejected by review"
+            decisions[belief_id] = (True, reason)
+    return decisions
 
 
 @cli.command("review-proposals")
 @click.option("--file", "proposals_file", default="proposed-beliefs.md",
               help="Proposals file to review")
+@click.option("--batch-size", type=int, default=20,
+              help="Proposals per LLM batch (default: 20)")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Show what would be rejected without modifying the file")
 @click.pass_context
-def review_proposals(ctx, proposals_file, dry_run):
-    """Filter low-quality belief proposals before acceptance.
+def review_proposals(ctx, proposals_file, batch_size, dry_run):
+    """Filter low-quality belief proposals using LLM review.
 
-    Checks proposals against rejection criteria: stale issue references,
-    meta/navel-gazing, duplicates, ephemeral snapshots, and speculative claims.
+    Sends proposals in batches to an LLM along with issue state data and
+    existing beliefs. The LLM judges each proposal against rejection criteria:
+    stale, factually false, meta, duplicate, ephemeral, speculative.
 
     Pipeline position: propose-beliefs → review-proposals → accept-beliefs
     """
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
     proposals_path = Path(proposals_file)
     if not proposals_path.exists():
         click.echo(f"Proposals file not found: {proposals_file}")
         sys.exit(1)
 
+    if not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
     project_dir = _get_project_dir()
     text = proposals_path.read_text()
 
-    # Load context for checks
+    # Load context
     cached_issues = _load_cached_issues(project_dir)
     try:
         network = _load_network()
@@ -1037,39 +1076,83 @@ def review_proposals(ctx, proposals_file, dry_run):
         click.echo("No proposals found in file.")
         return
 
-    # Review each proposal
+    # Separate already-rejected from reviewable
+    to_review = []
+    already_rejected = 0
+    for match in matches:
+        header = match.group(1)
+        if "[REJECT]" in header and "[ACCEPT" not in header:
+            already_rejected += 1
+            continue
+        to_review.append({
+            "match": match,
+            "header": header,
+            "id": match.group(2),
+            "text": match.group(3).strip(),
+            "source": match.group(4).strip().removeprefix("- Source: "),
+        })
+
+    if not to_review:
+        click.echo("No proposals to review (all already rejected).", err=True)
+        return
+
+    click.echo(f"Reviewing {len(to_review)} proposals ({already_rejected} already rejected)...", err=True)
+
+    # Build context sections (shared across batches)
+    issue_state = _build_issue_state_section(cached_issues)
+    existing_beliefs = _build_existing_beliefs_section(existing_nodes)
+
+    # Batch and review
+    all_decisions: dict[str, tuple[bool, str | None]] = {}
+    batches = [to_review[i:i + batch_size] for i in range(0, len(to_review), batch_size)]
+
+    for i, batch in enumerate(batches):
+        click.echo(f"  Batch {i + 1}/{len(batches)} ({len(batch)} proposals)...", err=True)
+
+        proposals_section = _build_proposals_section(batch)
+        prompt = _REVIEW_PROMPT.format(
+            issue_state=issue_state,
+            existing_beliefs=existing_beliefs,
+            proposals=proposals_section,
+        )
+
+        try:
+            result = invoke_sync(prompt, model=model, timeout=timeout)
+            decisions = _parse_review_response(result)
+            all_decisions.update(decisions)
+        except Exception as e:
+            click.echo(f"  ERROR in batch {i + 1}: {e}", err=True)
+            continue
+
+    # Apply decisions
     kept = 0
     rejected = 0
     categories: dict[str, int] = {}
     replacements: list[tuple[str, str]] = []
 
-    for match in matches:
-        header = match.group(1)
-        belief_id = match.group(2)
-        claim_text = match.group(3).strip()
+    for proposal in to_review:
+        belief_id = proposal["id"]
+        match = proposal["match"]
+        header = proposal["header"]
 
-        # Skip already-rejected proposals
-        if "[REJECT]" in header and "[ACCEPT" not in header:
+        decision = all_decisions.get(belief_id)
+        if decision is None:
             kept += 1
             continue
 
-        reject, reason = _review_proposal(
-            belief_id, claim_text, cached_issues, existing_nodes,
-        )
-
+        reject, reason = decision
         if reject:
             rejected += 1
-            category = reason.split(":")[0] if reason else "unknown"
+            category = reason.split(":")[0].strip() if reason else "unknown"
             categories[category] = categories.get(category, 0) + 1
 
             old_block = match.group(0)
             new_header = f"### [REJECT] {belief_id}"
             new_block = old_block.replace(
                 f"{header} {belief_id}",
-                f"{new_header}",
+                new_header,
                 1,
             )
-            # Append reason after the source line
             source_line = match.group(4).strip()
             new_block = new_block.replace(
                 source_line,
@@ -1084,7 +1167,7 @@ def review_proposals(ctx, proposals_file, dry_run):
             kept += 1
 
     # Summary
-    click.echo(f"\nReviewed {len(matches)} proposals: {kept} kept, {rejected} rejected", err=True)
+    click.echo(f"\nReviewed {len(to_review)} proposals: {kept} kept, {rejected} rejected", err=True)
     if categories:
         click.echo("Rejections by category:", err=True)
         for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
@@ -1094,7 +1177,6 @@ def review_proposals(ctx, proposals_file, dry_run):
         click.echo("\nDry run — no changes written.", err=True)
         return
 
-    # Apply replacements
     if replacements:
         for old_block, new_block in replacements:
             text = text.replace(old_block, new_block, 1)
