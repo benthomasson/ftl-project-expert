@@ -739,14 +739,30 @@ def _auto_accept_proposals(proposals: list[str]) -> None:
     click.echo(f"Accepted {added} belief(s).", err=True)
 
 
+def _entry_date(path: Path) -> str | None:
+    """Extract YYYY-MM-DD date from an entry path like entries/2026/04/30/foo.md."""
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part == "entries" and i + 3 < len(parts):
+            try:
+                y, m, d = parts[i + 1], parts[i + 2], parts[i + 3]
+                if len(y) == 4 and len(m) == 2 and len(d) == 2:
+                    return f"{y}-{m}-{d}"
+            except (IndexError, ValueError):
+                pass
+    return None
+
+
 @cli.command("propose-beliefs")
 @click.option("--batch-size", type=int, default=5, help="Entries per LLM batch")
 @click.option("--output", default="proposed-beliefs.md", help="Output file")
 @click.option("--all", "process_all", is_flag=True, help="Re-process all entries")
 @click.option("--auto", "auto_accept", is_flag=True, default=False,
               help="Automatically accept all proposed beliefs (no review step)")
+@click.option("--since", default=None,
+              help="Only process entries from this date onward (YYYY-MM-DD)")
 @click.pass_context
-def propose_beliefs(ctx, batch_size, output, process_all, auto_accept):
+def propose_beliefs(ctx, batch_size, output, process_all, auto_accept, since):
     """Extract candidate beliefs from entries for human review."""
     model = ctx.obj["model"]
     timeout = ctx.obj["timeout"]
@@ -764,6 +780,14 @@ def propose_beliefs(ctx, batch_size, output, process_all, auto_accept):
     if not entries:
         click.echo("No .md files found.")
         return
+
+    if since:
+        before = len(entries)
+        entries = [e for e in entries if (_entry_date(e) or "") >= since]
+        click.echo(f"Filtered to {len(entries)} entries since {since} (from {before} total)", err=True)
+        if not entries:
+            click.echo("No entries found since that date.")
+            return
 
     click.echo(f"Reading {len(entries)} entries...")
 
@@ -884,6 +908,200 @@ def accept_beliefs(proposals_file):
             sys.exit(1)
 
     click.echo(f"\nAccepted {added} beliefs")
+
+
+# --- review-proposals ---
+
+
+_ISSUE_ID_PATTERN = re.compile(r"\b(GH-\d+|GL-\d+|MR-\d+|PR-\d+|[A-Z][A-Z0-9]+-\d+)\b")
+
+_OPEN_WORDS = re.compile(
+    r"\b(is open|remains open|still open|unresolved|is blocking|blocks|"
+    r"is the sole blocker|open blocker|preventing completion|not yet resolved|"
+    r"has no assignee|unassigned and open)\b",
+    re.IGNORECASE,
+)
+
+_META_PATTERNS = re.compile(
+    r"\b(belief network|belief graph|node count|nodes in the|cascade analysis|"
+    r"retraction cascade|compaction|reason maintenance|knowledge base has|"
+    r"belief registry|network growth|navigation feature|belief system)\b",
+    re.IGNORECASE,
+)
+
+_EPHEMERAL_PATTERNS = re.compile(
+    r"\b(as of \d{4}|currently \d+ (days?|weeks?|months?)|"
+    r"has been open for \d+|open for \d+ days|"
+    r"\d+ nodes as of|network has \d+ (nodes?|beliefs?))\b",
+    re.IGNORECASE,
+)
+
+_SPECULATIVE_PATTERNS = re.compile(
+    r"\b(could lead to|might cause|may result in|should be|"
+    r"risk of|estimated|would likely|potentially|"
+    r"if not addressed|suggests that perhaps)\b",
+    re.IGNORECASE,
+)
+
+
+def _review_proposal(
+    belief_id: str,
+    claim_text: str,
+    cached_issues: dict,
+    existing_nodes: dict,
+) -> tuple[bool, str | None]:
+    """Check a single proposal against rejection criteria.
+
+    Returns (reject, reason) — reject=True means the proposal should be marked REJECT.
+    """
+    # 1. Stale — references issues as open when they're closed
+    issue_refs = _ISSUE_ID_PATTERN.findall(claim_text)
+    if issue_refs and _OPEN_WORDS.search(claim_text):
+        for ref in issue_refs:
+            cached = cached_issues.get(ref)
+            if cached and cached.get("state") in ("closed", "done", "resolved", "merged"):
+                return True, f"stale: {ref} is {cached['state']}"
+
+    # 2. Meta — about the belief network itself
+    if _META_PATTERNS.search(claim_text):
+        return True, "meta: about belief network, not the project"
+
+    # 3. Duplicate — belief ID already exists in network
+    if belief_id in existing_nodes:
+        return True, f"duplicate: {belief_id} already exists"
+
+    # 4. Duplicate — high word overlap with existing belief text
+    claim_words = set(claim_text.lower().split())
+    if len(claim_words) >= 4:
+        for node_id, node in existing_nodes.items():
+            node_text = node.get("text", "")
+            node_words = set(node_text.lower().split())
+            if not node_words:
+                continue
+            overlap = len(claim_words & node_words)
+            union = len(claim_words | node_words)
+            if union > 0 and overlap / union > 0.7:
+                return True, f"duplicate: overlaps with {node_id}"
+
+    # 5. Ephemeral — time-bound snapshots
+    if _EPHEMERAL_PATTERNS.search(claim_text):
+        return True, "ephemeral: time-bound snapshot"
+
+    # 6. Speculative — editorial/predictive language
+    if _SPECULATIVE_PATTERNS.search(claim_text):
+        return True, "speculative: predictive/editorial language"
+
+    return False, None
+
+
+@cli.command("review-proposals")
+@click.option("--file", "proposals_file", default="proposed-beliefs.md",
+              help="Proposals file to review")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Show what would be rejected without modifying the file")
+@click.pass_context
+def review_proposals(ctx, proposals_file, dry_run):
+    """Filter low-quality belief proposals before acceptance.
+
+    Checks proposals against rejection criteria: stale issue references,
+    meta/navel-gazing, duplicates, ephemeral snapshots, and speculative claims.
+
+    Pipeline position: propose-beliefs → review-proposals → accept-beliefs
+    """
+    proposals_path = Path(proposals_file)
+    if not proposals_path.exists():
+        click.echo(f"Proposals file not found: {proposals_file}")
+        sys.exit(1)
+
+    project_dir = _get_project_dir()
+    text = proposals_path.read_text()
+
+    # Load context for checks
+    cached_issues = _load_cached_issues(project_dir)
+    try:
+        network = _load_network()
+        existing_nodes = network.get("nodes", {})
+    except Exception:
+        existing_nodes = {}
+
+    # Parse all proposals
+    proposal_pattern = re.compile(
+        r"(### \[?(?:ACCEPT(?:/REJECT)?|REJECT)\]?)\s*(\S+)\n"
+        r"(.+?)\n"
+        r"(- Source: .+?)(?=\n###|\n---|\Z)",
+        re.DOTALL,
+    )
+
+    matches = list(proposal_pattern.finditer(text))
+    if not matches:
+        click.echo("No proposals found in file.")
+        return
+
+    # Review each proposal
+    kept = 0
+    rejected = 0
+    categories: dict[str, int] = {}
+    replacements: list[tuple[str, str]] = []
+
+    for match in matches:
+        header = match.group(1)
+        belief_id = match.group(2)
+        claim_text = match.group(3).strip()
+
+        # Skip already-rejected proposals
+        if "[REJECT]" in header and "[ACCEPT" not in header:
+            kept += 1
+            continue
+
+        reject, reason = _review_proposal(
+            belief_id, claim_text, cached_issues, existing_nodes,
+        )
+
+        if reject:
+            rejected += 1
+            category = reason.split(":")[0] if reason else "unknown"
+            categories[category] = categories.get(category, 0) + 1
+
+            old_block = match.group(0)
+            new_header = f"### [REJECT] {belief_id}"
+            new_block = old_block.replace(
+                f"{header} {belief_id}",
+                f"{new_header}",
+                1,
+            )
+            # Append reason after the source line
+            source_line = match.group(4).strip()
+            new_block = new_block.replace(
+                source_line,
+                f"{source_line}\n- Rejected: {reason}",
+                1,
+            )
+            replacements.append((old_block, new_block))
+
+            if dry_run:
+                click.echo(f"  REJECT {belief_id}: {reason}", err=True)
+        else:
+            kept += 1
+
+    # Summary
+    click.echo(f"\nReviewed {len(matches)} proposals: {kept} kept, {rejected} rejected", err=True)
+    if categories:
+        click.echo("Rejections by category:", err=True)
+        for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
+            click.echo(f"  {cat}: {count}", err=True)
+
+    if dry_run:
+        click.echo("\nDry run — no changes written.", err=True)
+        return
+
+    # Apply replacements
+    if replacements:
+        for old_block, new_block in replacements:
+            text = text.replace(old_block, new_block, 1)
+        proposals_path.write_text(text)
+        click.echo(f"Updated {proposals_file}", err=True)
+    else:
+        click.echo("No changes needed.", err=True)
 
 
 # --- derive ---
@@ -1500,7 +1718,7 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore):
     click.echo(f"{'=' * 40}", err=True)
 
     try:
-        topic_limit = max_explore or 999
+        topic_limit = max_explore or 99
         explored = 0
         while explored < topic_limit:
             topic = pop_next(project_dir)
@@ -1524,13 +1742,13 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore):
         errors.append(f"explore: {e}")
         click.echo(f"WARN: explore failed: {e}, continuing...", err=True)
 
-    # --- Step 3: Propose & accept beliefs ---
+    # --- Step 3: Propose beliefs ---
     click.echo(f"\n{'=' * 40}", err=True)
-    click.echo("Step 3: Proposing & accepting beliefs", err=True)
+    click.echo("Step 3: Proposing beliefs", err=True)
     click.echo(f"{'=' * 40}", err=True)
 
     try:
-        ctx.invoke(propose_beliefs, auto_accept=True)
+        ctx.invoke(propose_beliefs, since=since)
     except SystemExit as e:
         if e.code and e.code != 0:
             errors.append(f"propose-beliefs exited with code {e.code}")
@@ -1539,9 +1757,39 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore):
         errors.append(f"propose-beliefs: {e}")
         click.echo(f"WARN: propose-beliefs failed: {e}, continuing...", err=True)
 
-    # --- Step 4: Derive (exhaust) ---
+    # --- Step 4: Review proposals ---
     click.echo(f"\n{'=' * 40}", err=True)
-    click.echo("Step 4: Deriving logical consequences", err=True)
+    click.echo("Step 4: Reviewing proposals", err=True)
+    click.echo(f"{'=' * 40}", err=True)
+
+    try:
+        ctx.invoke(review_proposals)
+    except SystemExit as e:
+        if e.code and e.code != 0:
+            errors.append(f"review-proposals exited with code {e.code}")
+            click.echo(f"WARN: review-proposals failed (exit {e.code}), continuing...", err=True)
+    except Exception as e:
+        errors.append(f"review-proposals: {e}")
+        click.echo(f"WARN: review-proposals failed: {e}, continuing...", err=True)
+
+    # --- Step 5: Accept beliefs ---
+    click.echo(f"\n{'=' * 40}", err=True)
+    click.echo("Step 5: Accepting beliefs", err=True)
+    click.echo(f"{'=' * 40}", err=True)
+
+    try:
+        ctx.invoke(accept_beliefs)
+    except SystemExit as e:
+        if e.code and e.code != 0:
+            errors.append(f"accept-beliefs exited with code {e.code}")
+            click.echo(f"WARN: accept-beliefs failed (exit {e.code}), continuing...", err=True)
+    except Exception as e:
+        errors.append(f"accept-beliefs: {e}")
+        click.echo(f"WARN: accept-beliefs failed: {e}, continuing...", err=True)
+
+    # --- Step 6: Derive (exhaust) ---
+    click.echo(f"\n{'=' * 40}", err=True)
+    click.echo("Step 6: Deriving logical consequences", err=True)
     click.echo(f"{'=' * 40}", err=True)
 
     try:
@@ -1554,9 +1802,9 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore):
         errors.append(f"derive: {e}")
         click.echo(f"WARN: derive failed: {e}, continuing...", err=True)
 
-    # --- Step 5: Summary ---
+    # --- Step 7: Summary ---
     click.echo(f"\n{'=' * 40}", err=True)
-    click.echo("Step 5: Generating summary", err=True)
+    click.echo("Step 7: Generating summary", err=True)
     click.echo(f"{'=' * 40}", err=True)
 
     try:
