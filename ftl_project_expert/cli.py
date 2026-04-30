@@ -1028,10 +1028,8 @@ def _parse_review_response(response: str) -> dict[str, tuple[bool, str | None]]:
               help="Proposals file to review")
 @click.option("--batch-size", type=int, default=20,
               help="Proposals per LLM batch (default: 20)")
-@click.option("--dry-run", is_flag=True, default=False,
-              help="Show what would be rejected without modifying the file")
 @click.pass_context
-def review_proposals(ctx, proposals_file, batch_size, dry_run):
+def review_proposals(ctx, proposals_file, batch_size):
     """Filter low-quality belief proposals using LLM review.
 
     Sends proposals in batches to an LLM along with issue state data and
@@ -1160,9 +1158,7 @@ def review_proposals(ctx, proposals_file, batch_size, dry_run):
                 1,
             )
             replacements.append((old_block, new_block))
-
-            if dry_run:
-                click.echo(f"  REJECT {belief_id}: {reason}", err=True)
+            click.echo(f"  REJECT {belief_id}: {reason}", err=True)
         else:
             kept += 1
 
@@ -1172,10 +1168,6 @@ def review_proposals(ctx, proposals_file, batch_size, dry_run):
         click.echo("Rejections by category:", err=True)
         for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
             click.echo(f"  {cat}: {count}", err=True)
-
-    if dry_run:
-        click.echo("\nDry run — no changes written.", err=True)
-        return
 
     if replacements:
         for old_block, new_block in replacements:
