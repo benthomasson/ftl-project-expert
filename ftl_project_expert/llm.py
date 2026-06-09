@@ -54,3 +54,36 @@ async def invoke(prompt: str, model: str = "claude", timeout: int = DEFAULT_TIME
 def invoke_sync(prompt: str, model: str = "claude", timeout: int = DEFAULT_TIMEOUT) -> str:
     """Synchronous wrapper around invoke."""
     return asyncio.run(invoke(prompt, model, timeout))
+
+
+async def invoke_concurrent(
+    prompts: list[str],
+    model: str = "claude",
+    timeout: int = DEFAULT_TIMEOUT,
+    max_concurrent: int = 3,
+) -> list[str | Exception]:
+    """Invoke model on multiple prompts concurrently.
+
+    Returns a list in the same order as prompts. Each element is either
+    the model's response string or the Exception that occurred.
+    """
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _guarded(prompt: str) -> str:
+        async with sem:
+            return await invoke(prompt, model, timeout)
+
+    return await asyncio.gather(
+        *[_guarded(p) for p in prompts],
+        return_exceptions=True,
+    )
+
+
+def invoke_concurrent_sync(
+    prompts: list[str],
+    model: str = "claude",
+    timeout: int = DEFAULT_TIMEOUT,
+    max_concurrent: int = 3,
+) -> list[str | Exception]:
+    """Synchronous wrapper around invoke_concurrent."""
+    return asyncio.run(invoke_concurrent(prompts, model, timeout, max_concurrent))
