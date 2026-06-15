@@ -62,6 +62,23 @@ class GitHubSource:
         raw = json.loads(result.stdout)
         return self._normalize(raw)
 
+    def get_pr(self, number: int) -> PullRequest:
+        """Get a single pull request with full details."""
+        cmd = [
+            "gh", "pr", "view", str(number),
+            "--repo", self.repo,
+            "--json", "number,title,url,body,state,labels,author,"
+                      "createdAt,updatedAt,mergedAt,mergedBy,"
+                      "files,additions,deletions,changedFiles,"
+                      "reviews,comments,closingIssuesReferences",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"gh pr view failed: {result.stderr.strip()}")
+
+        raw = json.loads(result.stdout)
+        return self._normalize_pr(raw)
+
     def list_prs(
         self,
         state: str = "open",

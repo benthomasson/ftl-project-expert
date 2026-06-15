@@ -15,6 +15,7 @@ import click
 from .llm import check_model_available, invoke, invoke_concurrent_sync, invoke_sync
 from .prompts import (
     PROPOSE_BELIEFS_PROJECT,
+    RESEARCH_PROMPT,
     build_explore_prompt,
     build_scan_prompt,
     build_summary_prompt,
@@ -1313,6 +1314,303 @@ def review_proposals(ctx, proposals_file, batch_size, max_parallel):
         click.echo(f"Updated {proposals_file}", err=True)
     else:
         click.echo("No changes needed.", err=True)
+
+
+# --- research ---
+
+
+def _get_belief_info(belief_id: str) -> dict | None:
+    """Run `reasons show` and parse output to extract belief metadata."""
+    result = subprocess.run(
+        ["reasons", "show", belief_id],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    info = {"id": belief_id, "text": "", "source": "", "status": "",
+            "dependents": []}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Text:"):
+            info["text"] = line[5:].strip()
+        elif line.startswith("Status:"):
+            info["status"] = line[7:].strip()
+        elif line.startswith("Source:"):
+            info["source"] = line[7:].strip()
+        elif line.startswith("Dependents:"):
+            deps = line[11:].strip()
+            if deps:
+                info["dependents"] = [d.strip() for d in deps.split(",") if d.strip()]
+    return info
+
+
+def _extract_issue_refs(text: str) -> list[dict]:
+    """Extract issue and PR references from text.
+
+    Returns list of dicts with 'type' (issue/pr) and 'number' or 'key'.
+    """
+    refs = []
+    seen = set()
+
+    # GH-123, PR-123, GL-123, MR-123
+    for match in re.finditer(r"\b(GH|PR|GL|MR)-(\d+)\b", text):
+        prefix = match.group(1)
+        num = int(match.group(2))
+        kind = "pr" if prefix in ("PR", "MR") else "issue"
+        key = (kind, num)
+        if key not in seen:
+            seen.add(key)
+            refs.append({"type": kind, "number": num})
+
+    # #123 (common GitHub/GitLab shorthand)
+    for match in re.finditer(r"(?<!\w)#(\d+)\b", text):
+        num = int(match.group(1))
+        key = ("issue", num)
+        if key not in seen:
+            seen.add(key)
+            refs.append({"type": "issue", "number": num})
+
+    # PROJ-123 (Jira-style keys)
+    for match in re.finditer(r"\b([A-Z][A-Z0-9]+-\d+)\b", text):
+        jira_key = match.group(1)
+        if jira_key.startswith(("GH-", "PR-", "GL-", "MR-")):
+            continue
+        if jira_key not in seen:
+            seen.add(jira_key)
+            refs.append({"type": "issue", "key": jira_key})
+
+    return refs
+
+
+def _fetch_artifacts(refs: list[dict], source, config: dict) -> str:
+    """Fetch current state for each issue/PR reference."""
+    parts = []
+    platform = config["platform"]
+
+    for ref in refs:
+        ref_label = ref.get("key") or f"#{ref.get('number')}"
+        try:
+            if "key" in ref:
+                if platform != "jira":
+                    parts.append(f"(Skipping Jira key {ref['key']} on {platform})")
+                    continue
+                issue = source.get_issue(ref["key"])
+                parts.append(issue.to_prompt_text())
+            elif ref["type"] == "pr" and hasattr(source, "get_pr"):
+                pr = source.get_pr(ref["number"])
+                parts.append(pr.to_prompt_text())
+            elif ref["type"] == "issue":
+                issue = source.get_issue(ref["number"])
+                parts.append(issue.to_prompt_text())
+            else:
+                parts.append(f"(Could not fetch {ref['type']} {ref_label})")
+        except Exception as e:
+            parts.append(f"(Error fetching {ref['type']} {ref_label}: {e})")
+
+    return "\n\n---\n\n".join(parts) if parts else "(No artifacts fetched)"
+
+
+def _get_dependent_beliefs(belief_id: str, network: dict) -> str:
+    """Format dependent beliefs for the research prompt."""
+    nodes = network.get("nodes", {})
+    node = nodes.get(belief_id, {})
+    dep_ids = node.get("dependents", [])
+
+    if not dep_ids:
+        return "(No dependent beliefs)"
+
+    lines = []
+    for dep_id in dep_ids:
+        dep_node = nodes.get(dep_id, {})
+        text = dep_node.get("text", "")[:120]
+        status = dep_node.get("truth_value", "?")
+        lines.append(f"- `{dep_id}` [{status}]: {text}")
+    return "\n".join(lines)
+
+
+def _select_beliefs_for_research(network: dict, negative: bool = False,
+                                  high_impact: bool = False,
+                                  limit: int = 10) -> list[str]:
+    """Select belief IDs for research based on criteria."""
+    nodes = network.get("nodes", {})
+    candidates = []
+
+    for node_id, node in nodes.items():
+        tv = node.get("truth_value", "")
+
+        if negative and tv != "OUT":
+            continue
+        if not negative and tv != "IN":
+            continue
+
+        dep_count = len(node.get("dependents", []))
+        candidates.append((node_id, dep_count, tv))
+
+    if high_impact:
+        candidates.sort(key=lambda x: -x[1])
+    else:
+        candidates.sort(key=lambda x: x[0])
+
+    return [c[0] for c in candidates[:limit]]
+
+
+@cli.command("research")
+@click.argument("belief_id", required=False)
+@click.option("--negative", is_flag=True, default=False,
+              help="Select from OUT/negative beliefs")
+@click.option("--high-impact", is_flag=True, default=False,
+              help="Select by dependent count (highest first)")
+@click.option("--limit", "select_limit", type=int, default=1,
+              help="Number of beliefs to research (default: 1)")
+@click.option("--parallel", "max_parallel", type=int, default=1,
+              help="Max concurrent LLM calls (default: 1, try 3 for speed)")
+@click.pass_context
+def research(ctx, belief_id, negative, high_impact, select_limit, max_parallel):
+    """Verify a belief against its source system.
+
+    Fetches the current state of issues/PRs referenced by a belief,
+    compares against the belief's claims, and reports discrepancies.
+
+    Examples:
+        project-expert research my-belief-id
+        project-expert research --negative
+        project-expert research --high-impact --limit 5
+        project-expert research --high-impact --limit 5 --parallel 3
+    """
+    config = _load_config()
+    if not config:
+        click.echo("Not initialized. Run: project-expert init <platform> <target>")
+        sys.exit(1)
+
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
+    if not _has_reasons():
+        click.echo("Error: reasons CLI required. Install with: uv tool install ftl-reasons", err=True)
+        sys.exit(1)
+
+    if not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
+    # Determine which beliefs to research
+    network = _load_network()
+    if belief_id:
+        belief_ids = [belief_id]
+    else:
+        belief_ids = _select_beliefs_for_research(
+            network, negative=negative, high_impact=high_impact,
+            limit=select_limit,
+        )
+        if not belief_ids:
+            label = "negative " if negative else ""
+            click.echo(f"No {label}beliefs found to research.")
+            return
+        click.echo(f"Selected {len(belief_ids)} belief(s) for research:", err=True)
+        for bid in belief_ids:
+            click.echo(f"  {bid}", err=True)
+
+    source = _get_source(config)
+
+    def _research_one(bid: str) -> str | None:
+        """Build a research prompt for a single belief."""
+        info = _get_belief_info(bid)
+        if not info:
+            click.echo(f"Belief not found: {bid}", err=True)
+            return None
+
+        click.echo(f"\nResearching: {bid}", err=True)
+        click.echo(f"  Claim: {info['text'][:100]}", err=True)
+        click.echo(f"  Status: {info['status']}", err=True)
+
+        # Read source entry
+        source_entry = "(No source entry found)"
+        source_path = info.get("source", "")
+        if source_path:
+            entry_path = Path(source_path)
+            if entry_path.is_file():
+                content = entry_path.read_text()
+                if len(content) > 15000:
+                    content = content[:15000] + "\n[Truncated]"
+                source_entry = content
+                click.echo(f"  Source: {source_path}", err=True)
+
+        # Extract and fetch artifacts
+        all_text = f"{info['text']}\n{source_entry}"
+        refs = _extract_issue_refs(all_text)
+        click.echo(f"  Found {len(refs)} reference(s)", err=True)
+
+        artifacts = _fetch_artifacts(refs, source, config)
+
+        # Get dependent beliefs
+        dependents = _get_dependent_beliefs(bid, network)
+        dep_count = len(info.get("dependents", []))
+        if dep_count:
+            click.echo(f"  {dep_count} dependent belief(s)", err=True)
+
+        return RESEARCH_PROMPT.format(
+            belief_id=bid,
+            belief_text=info["text"],
+            belief_status=info["status"],
+            source_entry=source_entry,
+            artifacts=artifacts,
+            dependents=dependents,
+        )
+
+    # Build prompts
+    prompts_with_ids = []
+    for bid in belief_ids:
+        prompt = _research_one(bid)
+        if prompt:
+            prompts_with_ids.append((bid, prompt))
+
+    if not prompts_with_ids:
+        click.echo("No beliefs could be researched.")
+        return
+
+    # Invoke LLM
+    ids = [p[0] for p in prompts_with_ids]
+    prompts = [p[1] for p in prompts_with_ids]
+
+    click.echo(f"\nRunning {model} on {len(prompts)} belief(s)...", err=True)
+
+    if max_parallel > 1 and len(prompts) > 1:
+        results = invoke_concurrent_sync(prompts, model=model, timeout=timeout,
+                                         max_concurrent=max_parallel)
+    else:
+        results = []
+        for i, prompt in enumerate(prompts):
+            click.echo(f"  [{i + 1}/{len(prompts)}] {ids[i]}...", err=True)
+            try:
+                result = invoke_sync(prompt, model=model, timeout=timeout)
+                results.append(result)
+            except Exception as e:
+                click.echo(f"  ERROR: {e}", err=True)
+                results.append(e)
+
+    # Process results
+    for bid, result in zip(ids, results):
+        if isinstance(result, Exception):
+            click.echo(f"\nERROR researching {bid}: {result}", err=True)
+            continue
+
+        # Extract verdict
+        verdict = "UNKNOWN"
+        for line in result.splitlines():
+            line = line.strip()
+            if line.startswith("VERDICT:"):
+                verdict = line[8:].strip()
+                break
+
+        click.echo(f"\n{'=' * 40}", err=True)
+        click.echo(f"  {bid}: {verdict}", err=True)
+        click.echo(f"{'=' * 40}", err=True)
+
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "-", bid)[:80]
+        _create_entry(f"research-{safe_id}", f"Research: {bid} [{verdict}]", result)
+
+        _emit(ctx, result)
 
 
 # --- derive ---
