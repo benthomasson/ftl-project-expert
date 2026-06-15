@@ -182,7 +182,9 @@ def cli(ctx, quiet, model, timeout):
 @click.argument("target", type=str)
 @click.option("--domain", "-d", default=None, help="One-line project description")
 @click.option("--jira-url", default=None, help="Jira base URL (for jira platform)")
-def init(platform, target, domain, jira_url):
+@click.option("--github-repo", default=None,
+              help="GitHub owner/repo for cross-platform PR lookups (e.g., owner/repo)")
+def init(platform, target, domain, jira_url, github_repo):
     """Bootstrap a project-expert knowledge base.
 
     TARGET is owner/repo for GitHub/GitLab, or project key for Jira.
@@ -231,6 +233,12 @@ def init(platform, target, domain, jira_url):
     else:
         config["project"] = target
         config["jira_url"] = jira_url or os.environ.get("JIRA_URL", "")
+
+    if github_repo:
+        if not shutil.which("gh"):
+            click.echo("Error: gh CLI not found. Install from https://cli.github.com", err=True)
+            sys.exit(1)
+        config["github_repo"] = github_repo
 
     _save_config(config)
 
@@ -1383,7 +1391,8 @@ def _extract_issue_refs(text: str) -> list[dict]:
     return refs
 
 
-def _fetch_artifacts(refs: list[dict], source, config: dict) -> str:
+def _fetch_artifacts(refs: list[dict], source, config: dict,
+                     github_source=None) -> str:
     """Fetch current state for each issue/PR reference."""
     parts = []
     platform = config["platform"]
@@ -1397,12 +1406,25 @@ def _fetch_artifacts(refs: list[dict], source, config: dict) -> str:
                     continue
                 issue = source.get_issue(ref["key"])
                 parts.append(issue.to_prompt_text())
-            elif ref["type"] == "pr" and hasattr(source, "get_pr"):
-                pr = source.get_pr(ref["number"])
-                parts.append(pr.to_prompt_text())
+            elif ref["type"] == "pr":
+                if hasattr(source, "get_pr"):
+                    pr = source.get_pr(ref["number"])
+                    parts.append(pr.to_prompt_text())
+                elif github_source:
+                    pr = github_source.get_pr(ref["number"])
+                    parts.append(pr.to_prompt_text())
+                else:
+                    parts.append(f"(Could not fetch pr {ref_label} — no GitHub repo configured)")
             elif ref["type"] == "issue":
-                issue = source.get_issue(ref["number"])
-                parts.append(issue.to_prompt_text())
+                if platform == "jira" and isinstance(ref.get("number"), int):
+                    if github_source:
+                        issue = github_source.get_issue(ref["number"])
+                        parts.append(issue.to_prompt_text())
+                    else:
+                        parts.append(f"(Skipping numeric ref #{ref['number']} on Jira — no GitHub repo configured)")
+                else:
+                    issue = source.get_issue(ref["number"])
+                    parts.append(issue.to_prompt_text())
             else:
                 parts.append(f"(Could not fetch {ref['type']} {ref_label})")
         except Exception as e:
@@ -1513,6 +1535,12 @@ def research(ctx, belief_id, negative, high_impact, select_limit, max_parallel):
 
     source = _get_source(config)
 
+    github_source = None
+    gh_repo = config.get("github_repo")
+    if gh_repo and config["platform"] != "github":
+        github_source = GitHubSource(gh_repo)
+        click.echo(f"Using GitHub repo {gh_repo} for PR lookups", err=True)
+
     def _research_one(bid: str) -> str | None:
         """Build a research prompt for a single belief."""
         info = _get_belief_info(bid)
@@ -1541,7 +1569,7 @@ def research(ctx, belief_id, negative, high_impact, select_limit, max_parallel):
         refs = _extract_issue_refs(all_text)
         click.echo(f"  Found {len(refs)} reference(s)", err=True)
 
-        artifacts = _fetch_artifacts(refs, source, config)
+        artifacts = _fetch_artifacts(refs, source, config, github_source=github_source)
 
         # Get dependent beliefs
         dependents = _get_dependent_beliefs(bid, network)
@@ -2040,6 +2068,8 @@ def status():
         click.echo(f"Target:   {config.get('repo', config.get('project', 'unknown'))}")
         click.echo(f"Domain:   {config.get('domain', 'unknown')}")
         click.echo(f"Created:  {config.get('created', 'unknown')}")
+        if config.get("github_repo"):
+            click.echo(f"GitHub:   {config['github_repo']}")
     else:
         click.echo("Not initialized. Run: project-expert init <platform> <target>")
         return
