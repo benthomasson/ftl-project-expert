@@ -423,6 +423,9 @@ def _cache_issues(issues: list[Issue], project_dir: str) -> None:
     """Cache fetched issues so explore can reference them without re-fetching."""
     cache_path = os.path.join(project_dir, "issues-cache.json")
     data = {}
+    if os.path.isfile(cache_path):
+        with open(cache_path) as f:
+            data = json.load(f)
     for issue in issues:
         data[issue.id] = {
             "id": issue.id,
@@ -562,13 +565,41 @@ def explore(ctx, do_skip, pick_index, loop_max, max_parallel):
     if invalid_count:
         click.echo(f"Warning: {invalid_count} index(es) out of bounds, skipped.", err=True)
 
-    for seq, (idx, topic) in enumerate(valid_topics):
-        if len(valid_topics) > 1:
-            click.echo(f"\n{'=' * 40}", err=True)
-            click.echo(f"[{seq + 1}/{len(valid_topics)}] Topic #{idx}", err=True)
-            click.echo(f"{'=' * 40}", err=True)
+    if max_parallel > 1 and len(valid_topics) > 1:
+        model = ctx.obj["model"]
+        timeout = ctx.obj["timeout"]
+        config = _load_config()
 
-        _run_topic(ctx, topic)
+        if not check_model_available(model):
+            click.echo(f"Error: Model '{model}' CLI not available", err=True)
+            sys.exit(1)
+
+        topics_only = [t for _, t in valid_topics]
+        click.echo(f"Exploring {len(topics_only)} topic(s) in parallel...", err=True)
+        for t in topics_only:
+            click.echo(f"  [{t.kind}] {t.target}: {t.title}", err=True)
+
+        prompts = [_build_topic_prompt(t, config, project_dir) for t in topics_only]
+        results = invoke_concurrent_sync(prompts, model=model, timeout=timeout,
+                                         max_concurrent=max_parallel)
+
+        for topic, result in zip(topics_only, results):
+            if isinstance(result, Exception):
+                click.echo(f"  ERROR [{topic.target}]: {result}", err=True)
+                continue
+            safe_target = re.sub(r"[^a-zA-Z0-9_-]", "-", topic.target)[:80]
+            _create_entry(f"explore-{safe_target}", f"Explore: {topic.target}", result)
+            _enqueue_topics(result, source=f"explore:{topic.target}", project_dir=project_dir)
+            _report_beliefs(result)
+            _emit(ctx, result)
+    else:
+        for seq, (idx, topic) in enumerate(valid_topics):
+            if len(valid_topics) > 1:
+                click.echo(f"\n{'=' * 40}", err=True)
+                click.echo(f"[{seq + 1}/{len(valid_topics)}] Topic #{idx}", err=True)
+                click.echo(f"{'=' * 40}", err=True)
+
+            _run_topic(ctx, topic)
 
     remaining = pending_count(project_dir)
     if remaining:
