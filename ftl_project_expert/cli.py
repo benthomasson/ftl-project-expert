@@ -1353,16 +1353,17 @@ def _extract_issue_refs(text: str) -> list[dict]:
     refs = []
     seen = set()
 
-    # GH-123, PR-123
-    for match in re.finditer(r"\b(GH|PR)-(\d+)\b", text):
-        kind = "pr" if match.group(1) == "PR" else "issue"
+    # GH-123, PR-123, GL-123, MR-123
+    for match in re.finditer(r"\b(GH|PR|GL|MR)-(\d+)\b", text):
+        prefix = match.group(1)
         num = int(match.group(2))
+        kind = "pr" if prefix in ("PR", "MR") else "issue"
         key = (kind, num)
         if key not in seen:
             seen.add(key)
             refs.append({"type": kind, "number": num})
 
-    # #123 (common GitHub shorthand)
+    # #123 (common GitHub/GitLab shorthand)
     for match in re.finditer(r"(?<!\w)#(\d+)\b", text):
         num = int(match.group(1))
         key = ("issue", num)
@@ -1433,12 +1434,9 @@ def _select_beliefs_for_research(network: dict, negative: bool = False,
 
     for node_id, node in nodes.items():
         tv = node.get("truth_value", "")
-        has_justifications = bool(node.get("justifications"))
 
         if negative and tv != "OUT":
             continue
-        if not negative and not has_justifications:
-            pass  # premises are valid candidates
 
         dep_count = len(node.get("dependents", []))
         candidates.append((node_id, dep_count, tv))
@@ -1491,10 +1489,10 @@ def research(ctx, belief_id, negative, high_impact, select_limit, max_parallel):
         sys.exit(1)
 
     # Determine which beliefs to research
+    network = _load_network()
     if belief_id:
         belief_ids = [belief_id]
     else:
-        network = _load_network()
         belief_ids = _select_beliefs_for_research(
             network, negative=negative, high_impact=high_impact,
             limit=select_limit,
@@ -1508,8 +1506,6 @@ def research(ctx, belief_id, negative, high_impact, select_limit, max_parallel):
             click.echo(f"  {bid}", err=True)
 
     source = _get_source(config)
-    network = _load_network()
-    project_dir = _get_project_dir()
 
     def _research_one(bid: str) -> str | None:
         """Build a research prompt for a single belief."""
