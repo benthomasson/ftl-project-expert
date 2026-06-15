@@ -235,6 +235,9 @@ def init(platform, target, domain, jira_url, github_repo):
         config["jira_url"] = jira_url or os.environ.get("JIRA_URL", "")
 
     if github_repo:
+        if not shutil.which("gh"):
+            click.echo("Error: gh CLI not found. Install from https://cli.github.com", err=True)
+            sys.exit(1)
         config["github_repo"] = github_repo
 
     _save_config(config)
@@ -1413,8 +1416,15 @@ def _fetch_artifacts(refs: list[dict], source, config: dict,
                 else:
                     parts.append(f"(Could not fetch pr {ref_label} — no GitHub repo configured)")
             elif ref["type"] == "issue":
-                issue = source.get_issue(ref["number"])
-                parts.append(issue.to_prompt_text())
+                if platform == "jira" and isinstance(ref.get("number"), int):
+                    if github_source:
+                        issue = github_source.get_issue(ref["number"])
+                        parts.append(issue.to_prompt_text())
+                    else:
+                        parts.append(f"(Skipping numeric ref #{ref['number']} on Jira — no GitHub repo configured)")
+                else:
+                    issue = source.get_issue(ref["number"])
+                    parts.append(issue.to_prompt_text())
             else:
                 parts.append(f"(Could not fetch {ref['type']} {ref_label})")
         except Exception as e:
