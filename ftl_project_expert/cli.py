@@ -1389,20 +1389,24 @@ def _fetch_artifacts(refs: list[dict], source, config: dict) -> str:
     platform = config["platform"]
 
     for ref in refs:
+        ref_label = ref.get("key") or f"#{ref.get('number')}"
         try:
             if "key" in ref:
+                if platform != "jira":
+                    parts.append(f"(Skipping Jira key {ref['key']} on {platform})")
+                    continue
                 issue = source.get_issue(ref["key"])
                 parts.append(issue.to_prompt_text())
-            elif ref["type"] == "pr" and platform == "github" and hasattr(source, "get_pr"):
+            elif ref["type"] == "pr" and hasattr(source, "get_pr"):
                 pr = source.get_pr(ref["number"])
                 parts.append(pr.to_prompt_text())
             elif ref["type"] == "issue":
                 issue = source.get_issue(ref["number"])
                 parts.append(issue.to_prompt_text())
             else:
-                parts.append(f"(Could not fetch {ref['type']} #{ref.get('number', ref.get('key'))})")
+                parts.append(f"(Could not fetch {ref['type']} {ref_label})")
         except Exception as e:
-            parts.append(f"(Error fetching {ref['type']} #{ref.get('number', ref.get('key'))}: {e})")
+            parts.append(f"(Error fetching {ref['type']} {ref_label}: {e})")
 
     return "\n\n---\n\n".join(parts) if parts else "(No artifacts fetched)"
 
@@ -1436,6 +1440,8 @@ def _select_beliefs_for_research(network: dict, negative: bool = False,
         tv = node.get("truth_value", "")
 
         if negative and tv != "OUT":
+            continue
+        if not negative and tv != "IN":
             continue
 
         dep_count = len(node.get("dependents", []))
