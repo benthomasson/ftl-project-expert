@@ -12,7 +12,7 @@ from pathlib import Path
 
 import click
 
-from .llm import check_model_available, invoke, invoke_concurrent, invoke_concurrent_sync, invoke_sync
+from .llm import check_model_available, invoke, invoke_concurrent_sync, invoke_sync
 from .prompts import (
     PROPOSE_BELIEFS_PROJECT,
     build_explore_prompt,
@@ -270,8 +270,10 @@ def init(platform, target, domain, jira_url):
               help="Auto-paginate through all issues (uses --limit as page size)")
 @click.option("--jql", default=None,
               help="Custom JQL query (Jira only)")
+@click.option("--per-issue", is_flag=True, default=False,
+              help="Queue each issue as a topic for individual exploration (no LLM)")
 @click.pass_context
-def scan(ctx, state, labels, limit, page, all_pages, jql):
+def scan(ctx, state, labels, limit, page, all_pages, jql, per_issue):
     """Scan project issues and create an overview."""
     config = _load_config()
     if not config:
@@ -298,6 +300,9 @@ def scan(ctx, state, labels, limit, page, all_pages, jql):
         else:
             state = "open"
 
+    if per_issue:
+        all_pages = True
+
     if all_pages:
         current_page = 1
         total_scanned = 0
@@ -307,7 +312,7 @@ def scan(ctx, state, labels, limit, page, all_pages, jql):
             click.echo(f"{'=' * 40}", err=True)
             count = _scan_page(
                 ctx, config, source, model, timeout, project_dir,
-                state, label_list, limit, current_page, jql,
+                state, label_list, limit, current_page, jql, per_issue,
             )
             if count == 0:
                 if total_scanned == 0:
@@ -323,12 +328,12 @@ def scan(ctx, state, labels, limit, page, all_pages, jql):
     else:
         _scan_page(
             ctx, config, source, model, timeout, project_dir,
-            state, label_list, limit, page, jql,
+            state, label_list, limit, page, jql, per_issue,
         )
 
 
 def _scan_page(ctx, config, source, model, timeout, project_dir,
-               state, label_list, limit, page, jql):
+               state, label_list, limit, page, jql, per_issue=False):
     """Scan a single page of issues. Returns the number of issues fetched."""
     project_name = config.get("repo", config.get("project", "unknown"))
     click.echo(f"Scanning {project_name} (page {page})...", err=True)
@@ -348,6 +353,22 @@ def _scan_page(ctx, config, source, model, timeout, project_dir,
         return 0
 
     click.echo(f"Fetched {len(issues)} issues", err=True)
+
+    if per_issue:
+        from .topics import Topic, add_topics
+        topics = [
+            Topic(
+                title=issue.title,
+                kind="issue",
+                target=issue.id,
+                source=f"scan:{project_name}",
+            )
+            for issue in issues
+        ]
+        added = add_topics(topics, project_dir)
+        _cache_issues(issues, project_dir)
+        click.echo(f"Queued {added} topic(s) from {len(issues)} issues", err=True)
+        return len(issues)
 
     # Fetch PRs for platforms that support them
     prs = []
@@ -589,6 +610,11 @@ def _explore_loop_parallel(ctx, project_dir, max_topics, max_parallel):
     model = ctx.obj["model"]
     timeout = ctx.obj["timeout"]
     config = _load_config()
+
+    if not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
     explored = 0
 
     while explored < max_topics:
