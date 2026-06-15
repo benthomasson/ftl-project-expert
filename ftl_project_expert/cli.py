@@ -12,7 +12,7 @@ from pathlib import Path
 
 import click
 
-from .llm import check_model_available, invoke, invoke_sync
+from .llm import check_model_available, invoke, invoke_concurrent_sync, invoke_sync
 from .prompts import (
     PROPOSE_BELIEFS_PROJECT,
     build_explore_prompt,
@@ -270,8 +270,10 @@ def init(platform, target, domain, jira_url):
               help="Auto-paginate through all issues (uses --limit as page size)")
 @click.option("--jql", default=None,
               help="Custom JQL query (Jira only)")
+@click.option("--per-issue", is_flag=True, default=False,
+              help="Queue each issue as a topic for individual exploration (no LLM)")
 @click.pass_context
-def scan(ctx, state, labels, limit, page, all_pages, jql):
+def scan(ctx, state, labels, limit, page, all_pages, jql, per_issue):
     """Scan project issues and create an overview."""
     config = _load_config()
     if not config:
@@ -298,6 +300,9 @@ def scan(ctx, state, labels, limit, page, all_pages, jql):
         else:
             state = "open"
 
+    if per_issue:
+        all_pages = True
+
     if all_pages:
         current_page = 1
         total_scanned = 0
@@ -307,7 +312,7 @@ def scan(ctx, state, labels, limit, page, all_pages, jql):
             click.echo(f"{'=' * 40}", err=True)
             count = _scan_page(
                 ctx, config, source, model, timeout, project_dir,
-                state, label_list, limit, current_page, jql,
+                state, label_list, limit, current_page, jql, per_issue,
             )
             if count == 0:
                 if total_scanned == 0:
@@ -323,12 +328,12 @@ def scan(ctx, state, labels, limit, page, all_pages, jql):
     else:
         _scan_page(
             ctx, config, source, model, timeout, project_dir,
-            state, label_list, limit, page, jql,
+            state, label_list, limit, page, jql, per_issue,
         )
 
 
 def _scan_page(ctx, config, source, model, timeout, project_dir,
-               state, label_list, limit, page, jql):
+               state, label_list, limit, page, jql, per_issue=False):
     """Scan a single page of issues. Returns the number of issues fetched."""
     project_name = config.get("repo", config.get("project", "unknown"))
     click.echo(f"Scanning {project_name} (page {page})...", err=True)
@@ -348,6 +353,22 @@ def _scan_page(ctx, config, source, model, timeout, project_dir,
         return 0
 
     click.echo(f"Fetched {len(issues)} issues", err=True)
+
+    if per_issue:
+        from .topics import Topic, add_topics
+        topics = [
+            Topic(
+                title=issue.title,
+                kind="issue",
+                target=issue.id,
+                source=f"scan:{project_name}",
+            )
+            for issue in issues
+        ]
+        added = add_topics(topics, project_dir)
+        _cache_issues(issues, project_dir)
+        click.echo(f"Queued {added} topic(s) from {len(issues)} issues", err=True)
+        return len(issues)
 
     # Fetch PRs for platforms that support them
     prs = []
@@ -402,6 +423,9 @@ def _cache_issues(issues: list[Issue], project_dir: str) -> None:
     """Cache fetched issues so explore can reference them without re-fetching."""
     cache_path = os.path.join(project_dir, "issues-cache.json")
     data = {}
+    if os.path.isfile(cache_path):
+        with open(cache_path) as f:
+            data = json.load(f)
     for issue in issues:
         data[issue.id] = {
             "id": issue.id,
@@ -489,8 +513,10 @@ def topics(show_all):
               help="Pick topic(s) by index — single (3) or comma-separated (1,3,8)")
 @click.option("--loop", "loop_max", type=int, default=None,
               help="Continuously explore up to N topics")
+@click.option("--parallel", "max_parallel", type=int, default=1,
+              help="Max concurrent LLM calls (default: 1, try 3 for speed)")
 @click.pass_context
-def explore(ctx, do_skip, pick_index, loop_max):
+def explore(ctx, do_skip, pick_index, loop_max, max_parallel):
     """Explore the next topic in the queue."""
     project_dir = _get_project_dir()
 
@@ -498,7 +524,7 @@ def explore(ctx, do_skip, pick_index, loop_max):
         if do_skip or pick_index:
             click.echo("Error: --loop cannot be combined with --skip or --pick", err=True)
             sys.exit(1)
-        _explore_loop(ctx, project_dir, loop_max)
+        _explore_loop(ctx, project_dir, loop_max, max_parallel)
         return
 
     if do_skip:
@@ -539,13 +565,41 @@ def explore(ctx, do_skip, pick_index, loop_max):
     if invalid_count:
         click.echo(f"Warning: {invalid_count} index(es) out of bounds, skipped.", err=True)
 
-    for seq, (idx, topic) in enumerate(valid_topics):
-        if len(valid_topics) > 1:
-            click.echo(f"\n{'=' * 40}", err=True)
-            click.echo(f"[{seq + 1}/{len(valid_topics)}] Topic #{idx}", err=True)
-            click.echo(f"{'=' * 40}", err=True)
+    if max_parallel > 1 and len(valid_topics) > 1:
+        model = ctx.obj["model"]
+        timeout = ctx.obj["timeout"]
+        config = _load_config()
 
-        _run_topic(ctx, topic)
+        if not check_model_available(model):
+            click.echo(f"Error: Model '{model}' CLI not available", err=True)
+            sys.exit(1)
+
+        topics_only = [t for _, t in valid_topics]
+        click.echo(f"Exploring {len(topics_only)} topic(s) in parallel...", err=True)
+        for t in topics_only:
+            click.echo(f"  [{t.kind}] {t.target}: {t.title}", err=True)
+
+        prompts = [_build_topic_prompt(t, config, project_dir) for t in topics_only]
+        results = invoke_concurrent_sync(prompts, model=model, timeout=timeout,
+                                         max_concurrent=max_parallel)
+
+        for topic, result in zip(topics_only, results):
+            if isinstance(result, Exception):
+                click.echo(f"  ERROR [{topic.target}]: {result}", err=True)
+                continue
+            safe_target = re.sub(r"[^a-zA-Z0-9_-]", "-", topic.target)[:80]
+            _create_entry(f"explore-{safe_target}", f"Explore: {topic.target}", result)
+            _enqueue_topics(result, source=f"explore:{topic.target}", project_dir=project_dir)
+            _report_beliefs(result)
+            _emit(ctx, result)
+    else:
+        for seq, (idx, topic) in enumerate(valid_topics):
+            if len(valid_topics) > 1:
+                click.echo(f"\n{'=' * 40}", err=True)
+                click.echo(f"[{seq + 1}/{len(valid_topics)}] Topic #{idx}", err=True)
+                click.echo(f"{'=' * 40}", err=True)
+
+            _run_topic(ctx, topic)
 
     remaining = pending_count(project_dir)
     if remaining:
@@ -554,8 +608,12 @@ def explore(ctx, do_skip, pick_index, loop_max):
         click.echo("\nNo more topics. Exploration complete.", err=True)
 
 
-def _explore_loop(ctx, project_dir, max_topics):
+def _explore_loop(ctx, project_dir, max_topics, max_parallel=1):
     """Continuously explore topics up to max_topics."""
+    if max_parallel > 1:
+        _explore_loop_parallel(ctx, project_dir, max_topics, max_parallel)
+        return
+
     explored = 0
     while explored < max_topics:
         topic = pop_next(project_dir)
@@ -578,38 +636,72 @@ def _explore_loop(ctx, project_dir, max_topics):
     click.echo(f"\nExplored {explored} topic(s). {remaining} remaining.", err=True)
 
 
-def _run_topic(ctx, topic: Topic):
-    """Explore a single topic."""
+def _explore_loop_parallel(ctx, project_dir, max_topics, max_parallel):
+    """Explore topics in parallel batches."""
     model = ctx.obj["model"]
     timeout = ctx.obj["timeout"]
-    project_dir = _get_project_dir()
     config = _load_config()
 
     if not check_model_available(model):
         click.echo(f"Error: Model '{model}' CLI not available", err=True)
         sys.exit(1)
 
-    click.echo(f"Topic: [{topic.kind}] {topic.target}", err=True)
-    click.echo(f"  {topic.title}", err=True)
-    click.echo(err=True)
+    explored = 0
 
-    # Fetch issue details if it's an issue/epic topic
+    while explored < max_topics:
+        batch_size = min(max_parallel, max_topics - explored)
+        batch_topics = []
+        for _ in range(batch_size):
+            topic = pop_next(project_dir)
+            if topic is None:
+                break
+            batch_topics.append(topic)
+
+        if not batch_topics:
+            if explored == 0:
+                click.echo("No pending topics. Run `project-expert scan` to discover topics.")
+            else:
+                click.echo(f"\nNo more topics after {explored} exploration(s).", err=True)
+            return
+
+        click.echo(f"\nExploring {len(batch_topics)} topic(s) in parallel...", err=True)
+        for t in batch_topics:
+            click.echo(f"  [{t.kind}] {t.target}: {t.title}", err=True)
+
+        prompts = [_build_topic_prompt(t, config, project_dir) for t in batch_topics]
+        results = invoke_concurrent_sync(prompts, model=model, timeout=timeout,
+                                         max_concurrent=max_parallel)
+
+        for topic, result in zip(batch_topics, results):
+            explored += 1
+            if isinstance(result, Exception):
+                click.echo(f"  ERROR [{topic.target}]: {result}", err=True)
+                continue
+            safe_target = re.sub(r"[^a-zA-Z0-9_-]", "-", topic.target)[:80]
+            _create_entry(f"explore-{safe_target}", f"Explore: {topic.target}", result)
+            _enqueue_topics(result, source=f"explore:{topic.target}", project_dir=project_dir)
+            _report_beliefs(result)
+            _emit(ctx, result)
+
+    remaining = pending_count(project_dir)
+    click.echo(f"\nExplored {explored} topic(s). {remaining} remaining.", err=True)
+
+
+def _build_topic_prompt(topic: Topic, config: dict | None, project_dir: str) -> str:
+    """Build the explore prompt for a topic without invoking the LLM."""
     issue_text = ""
     context_text = ""
 
     if topic.kind in ("issue", "epic") and config:
         try:
             source = _get_source(config)
-            # Extract issue number/key from target
             issue_id = topic.target
             if config["platform"] == "github":
-                # Target might be "GH-123" or just "123"
                 num = re.search(r"\d+", issue_id)
                 if num:
                     issue = source.get_issue(int(num.group()))
                     issue_text = issue.to_prompt_text()
 
-                    # Get related issues from cache
                     cached = _load_cached_issues(project_dir)
                     related_ids = issue.children + issue.linked
                     if issue.parent:
@@ -639,7 +731,6 @@ def _run_topic(ctx, topic: Topic):
         except Exception as e:
             click.echo(f"Warning: Could not fetch issue {topic.target}: {e}", err=True)
 
-    # If we couldn't fetch, use cached data or the title as context
     if not issue_text:
         cached = _load_cached_issues(project_dir)
         if topic.target in cached:
@@ -655,11 +746,29 @@ def _run_topic(ctx, topic: Topic):
         else:
             issue_text = f"## {topic.target}\n\n{topic.title}"
 
-    prompt = build_explore_prompt(
+    return build_explore_prompt(
         issue_text=issue_text,
         context_text=context_text or None,
         question=topic.title,
     )
+
+
+def _run_topic(ctx, topic: Topic):
+    """Explore a single topic."""
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+    project_dir = _get_project_dir()
+    config = _load_config()
+
+    if not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
+    click.echo(f"Topic: [{topic.kind}] {topic.target}", err=True)
+    click.echo(f"  {topic.title}", err=True)
+    click.echo(err=True)
+
+    prompt = _build_topic_prompt(topic, config, project_dir)
 
     click.echo(f"Exploring with {model}...", err=True)
     try:
@@ -761,8 +870,10 @@ def _entry_date(path: Path) -> str | None:
               help="Automatically accept all proposed beliefs (no review step)")
 @click.option("--since", default=None,
               help="Only process entries from this date onward (YYYY-MM-DD)")
+@click.option("--parallel", "max_parallel", type=int, default=1,
+              help="Max concurrent LLM calls (default: 1, try 3 for speed)")
 @click.pass_context
-def propose_beliefs(ctx, batch_size, output, process_all, auto_accept, since):
+def propose_beliefs(ctx, batch_size, output, process_all, auto_accept, since, max_parallel):
     """Extract candidate beliefs from entries for human review."""
     model = ctx.obj["model"]
     timeout = ctx.obj["timeout"]
@@ -805,18 +916,29 @@ def propose_beliefs(ctx, batch_size, output, process_all, auto_accept, since):
     if current_batch:
         batches.append("\n\n".join(current_batch))
 
-    click.echo(f"Processing {len(batches)} batches...")
+    click.echo(f"Processing {len(batches)} batches (parallel={max_parallel})...")
 
-    all_proposals = []
-    for i, batch_text in enumerate(batches):
-        click.echo(f"  Batch {i + 1}/{len(batches)}...")
-        prompt = PROPOSE_BELIEFS_PROJECT.format(entries=batch_text)
-        try:
-            result = invoke_sync(prompt, model=model, timeout=timeout)
-            all_proposals.append(result)
-        except Exception as e:
-            click.echo(f"  ERROR: {e}")
-            continue
+    prompts = [PROPOSE_BELIEFS_PROJECT.format(entries=bt) for bt in batches]
+
+    if max_parallel > 1 and len(prompts) > 1:
+        results = invoke_concurrent_sync(prompts, model=model, timeout=timeout,
+                                         max_concurrent=max_parallel)
+        all_proposals = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                click.echo(f"  Batch {i + 1} ERROR: {r}")
+            else:
+                all_proposals.append(r)
+    else:
+        all_proposals = []
+        for i, prompt in enumerate(prompts):
+            click.echo(f"  Batch {i + 1}/{len(prompts)}...")
+            try:
+                result = invoke_sync(prompt, model=model, timeout=timeout)
+                all_proposals.append(result)
+            except Exception as e:
+                click.echo(f"  ERROR: {e}")
+                continue
 
     if auto_accept:
         _auto_accept_proposals(all_proposals)
@@ -1028,8 +1150,10 @@ def _parse_review_response(response: str) -> dict[str, tuple[bool, str | None]]:
               help="Proposals file to review")
 @click.option("--batch-size", type=int, default=20,
               help="Proposals per LLM batch (default: 20)")
+@click.option("--parallel", "max_parallel", type=int, default=1,
+              help="Max concurrent LLM calls (default: 1, try 3 for speed)")
 @click.pass_context
-def review_proposals(ctx, proposals_file, batch_size):
+def review_proposals(ctx, proposals_file, batch_size, max_parallel):
     """Filter low-quality belief proposals using LLM review.
 
     Sends proposals in batches to an LLM along with issue state data and
@@ -1104,23 +1228,36 @@ def review_proposals(ctx, proposals_file, batch_size):
     all_decisions: dict[str, tuple[bool, str | None]] = {}
     batches = [to_review[i:i + batch_size] for i in range(0, len(to_review), batch_size)]
 
-    for i, batch in enumerate(batches):
-        click.echo(f"  Batch {i + 1}/{len(batches)} ({len(batch)} proposals)...", err=True)
-
-        proposals_section = _build_proposals_section(batch)
-        prompt = _REVIEW_PROMPT.format(
+    prompts = [
+        _REVIEW_PROMPT.format(
             issue_state=issue_state,
             existing_beliefs=existing_beliefs,
-            proposals=proposals_section,
+            proposals=_build_proposals_section(batch),
         )
+        for batch in batches
+    ]
 
-        try:
-            result = invoke_sync(prompt, model=model, timeout=timeout)
-            decisions = _parse_review_response(result)
-            all_decisions.update(decisions)
-        except Exception as e:
-            click.echo(f"  ERROR in batch {i + 1}: {e}", err=True)
-            continue
+    click.echo(f"  {len(batches)} batch(es) (parallel={max_parallel})...", err=True)
+
+    if max_parallel > 1 and len(prompts) > 1:
+        results = invoke_concurrent_sync(prompts, model=model, timeout=timeout,
+                                         max_concurrent=max_parallel)
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                click.echo(f"  ERROR in batch {i + 1}: {r}", err=True)
+            else:
+                decisions = _parse_review_response(r)
+                all_decisions.update(decisions)
+    else:
+        for i, prompt in enumerate(prompts):
+            click.echo(f"  Batch {i + 1}/{len(batches)} ({len(batches[i])} proposals)...", err=True)
+            try:
+                result = invoke_sync(prompt, model=model, timeout=timeout)
+                decisions = _parse_review_response(result)
+                all_decisions.update(decisions)
+            except Exception as e:
+                click.echo(f"  ERROR in batch {i + 1}: {e}", err=True)
+                continue
 
     # Apply decisions
     kept = 0
@@ -1691,8 +1828,10 @@ def _load_update_checkpoint(project_dir: str) -> str | None:
               help="Auto-paginate through all matching issues")
 @click.option("--max-explore", type=int, default=None,
               help="Max topics to explore (default: all pending)")
+@click.option("--parallel", "max_parallel", type=int, default=1,
+              help="Max concurrent LLM calls (default: 1, try 3 for speed)")
 @click.pass_context
-def update(ctx, since, since_last, state, limit, all_pages, max_explore):
+def update(ctx, since, since_last, state, limit, all_pages, max_explore, max_parallel):
     """Automated update pipeline: scan, explore, extract beliefs, derive, summarize.
 
     Pulls all issues/PRs updated since a date, explores them, proposes and
@@ -1793,20 +1932,7 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore):
 
     try:
         topic_limit = max_explore or 99
-        explored = 0
-        while explored < topic_limit:
-            topic = pop_next(project_dir)
-            if topic is None:
-                break
-            explored += 1
-            remaining = pending_count(project_dir)
-            click.echo(f"\n  [{explored}] ({remaining} remaining)", err=True)
-            _run_topic(ctx, topic)
-
-        if explored == 0:
-            click.echo("No topics to explore.", err=True)
-        else:
-            click.echo(f"Explored {explored} topic(s).", err=True)
+        _explore_loop(ctx, project_dir, topic_limit, max_parallel)
 
     except SystemExit as e:
         if e.code and e.code != 0:
@@ -1822,7 +1948,7 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore):
     click.echo(f"{'=' * 40}", err=True)
 
     try:
-        ctx.invoke(propose_beliefs, since=since)
+        ctx.invoke(propose_beliefs, since=since, max_parallel=max_parallel)
     except SystemExit as e:
         if e.code and e.code != 0:
             errors.append(f"propose-beliefs exited with code {e.code}")
@@ -1837,7 +1963,7 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore):
     click.echo(f"{'=' * 40}", err=True)
 
     try:
-        ctx.invoke(review_proposals)
+        ctx.invoke(review_proposals, max_parallel=max_parallel)
     except SystemExit as e:
         if e.code and e.code != 0:
             errors.append(f"review-proposals exited with code {e.code}")
