@@ -146,13 +146,17 @@ def _report_beliefs(response: str) -> None:
 def _reasons_export():
     beliefs_path = Path("beliefs.md")
     network_path = Path("network.json")
-    result = subprocess.run(["reasons", "export-markdown"], capture_output=True, text=True)
+    result = subprocess.run(
+        ["reasons", "export-markdown", "-o", str(beliefs_path)],
+        capture_output=True, text=True,
+    )
     if result.returncode == 0:
-        beliefs_path.write_text(result.stdout)
         click.echo(f"Updated {beliefs_path}")
-    result = subprocess.run(["reasons", "export"], capture_output=True, text=True)
+    result = subprocess.run(
+        ["reasons", "export", "-o", str(network_path)],
+        capture_output=True, text=True,
+    )
     if result.returncode == 0:
-        network_path.write_text(result.stdout)
         click.echo(f"Updated {network_path}")
 
 
@@ -1622,11 +1626,13 @@ def _load_network() -> dict:
     if not network_path.exists():
         if _has_reasons():
             result = subprocess.run(
-                ["reasons", "export"], capture_output=True, text=True,
+                ["reasons", "export", "-o", str(network_path)],
+                capture_output=True, text=True,
             )
-            if result.returncode == 0:
-                return json.loads(result.stdout)
-        return {"nodes": {}}
+            if result.returncode != 0:
+                return {"nodes": {}}
+        else:
+            return {"nodes": {}}
     return json.loads(network_path.read_text())
 
 
