@@ -2053,7 +2053,7 @@ def summary(ctx):
     elif Path("beliefs.md").exists():
         full_text = Path("beliefs.md").read_text()
         sections = re.split(r"(?=^### \S+)", full_text, flags=re.MULTILINE)
-        sections = [s for s in sections if s.strip()]
+        sections = [s for s in sections if s.strip().startswith("###")]
         total_count = len(sections)
         if total_count > max_beliefs:
             sections = sections[:max_beliefs]
@@ -2083,6 +2083,7 @@ def summary(ctx):
         project_name=project_name,
         belief_count=belief_count,
         total_count=total_count,
+        sorted_by_impact=sorted_by_impact,
     )
 
     prompt_size_kb = len(prompt.encode()) / 1024
