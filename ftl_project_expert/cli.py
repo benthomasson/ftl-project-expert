@@ -2164,7 +2164,7 @@ def _compute_team_signals(cached_issues: dict) -> dict:
 
     team = defaultdict(lambda: {
         "open": 0, "closed_recent": 0, "total": 0,
-        "priorities": defaultdict(int), "labels": defaultdict(int),
+        "priorities": defaultdict(int),
     })
     total_open = 0
     unassigned_open = 0
@@ -2276,7 +2276,21 @@ def _format_backlog_section(
     else:
         issue_list = []
 
-    gating_ids = {g["id"] for g in gating_analysis}
+    # Build a map from issue tracker IDs to max belief downstream count
+    issue_belief_impact = {}
+    for g in gating_analysis:
+        for ref in _extract_issue_refs(g["text"]):
+            if "key" in ref:
+                ref_keys = [ref["key"]]
+            elif "number" in ref:
+                ref_keys = [f"GH-{ref['number']}", f"GL-{ref['number']}"]
+            else:
+                continue
+            for ref_key in ref_keys:
+                existing = issue_belief_impact.get(ref_key, 0)
+                issue_belief_impact[ref_key] = max(existing, g["downstream_count"])
+
+    priority_order = {"critical": 0, "highest": 1, "high": 2, "medium": 3, "low": 4}
 
     open_issues = []
     for issue in issue_list:
@@ -2285,19 +2299,18 @@ def _format_backlog_section(
             continue
 
         issue_id = str(issue.get("id", ""))
-        refs_in_beliefs = issue_id in gating_ids
+        belief_impact = issue_belief_impact.get(issue_id, 0)
 
-        priority_order = {"critical": 0, "highest": 1, "high": 2, "medium": 3, "low": 4}
         prio = (issue.get("priority") or "medium").lower()
         prio_rank = priority_order.get(prio, 3)
 
         open_issues.append({
             "issue": issue,
             "priority_rank": prio_rank,
-            "refs_in_beliefs": refs_in_beliefs,
+            "belief_impact": belief_impact,
         })
 
-    open_issues.sort(key=lambda x: (0 if x["refs_in_beliefs"] else 1, x["priority_rank"]))
+    open_issues.sort(key=lambda x: (-x["belief_impact"], x["priority_rank"]))
 
     if not open_issues:
         return "No open issues found in cache."
@@ -2306,21 +2319,18 @@ def _format_backlog_section(
     for item in open_issues[:max_items]:
         issue = item["issue"]
         assignees = issue.get("assignees") or []
-        if isinstance(assignees, list) and assignees:
-            assignee_str = ", ".join(
-                a if isinstance(a, str) else a.get("login", a.get("name", "?"))
-                for a in assignees
-            )
-        else:
-            assignee_str = "unassigned"
+        assignee_str = ", ".join(assignees) if assignees else "unassigned"
         prio = issue.get("priority") or "—"
         title = (issue.get("title") or "")[:100]
         issue_id = issue.get("id", "?")
         milestone = issue.get("milestone") or ""
         updated = (issue.get("updated") or "")[:10]
+        impact = item["belief_impact"]
 
         line = f"- **{issue_id}**: {title}"
         line += f"\n  Priority: {prio} | Assignee: {assignee_str} | Updated: {updated}"
+        if impact > 0:
+            line += f" | Belief impact: {impact} downstream"
         if milestone:
             line += f" | Milestone: {milestone}"
         lines.append(line)
