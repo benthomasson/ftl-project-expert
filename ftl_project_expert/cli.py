@@ -2031,17 +2031,27 @@ def summary(ctx):
         sys.exit(1)
 
     # Read beliefs from reasons or beliefs.md
+    max_beliefs = 500
     beliefs_text = ""
     belief_count = 0
+    total_count = 0
 
     if _has_reasons() and Path("reasons.db").exists():
-        result = subprocess.run(["reasons", "list"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["reasons", "list", "--status", "IN", "--by-impact"],
+            capture_output=True, text=True,
+        )
         if result.returncode == 0 and result.stdout.strip():
-            beliefs_text = result.stdout
-            belief_count = len([l for l in result.stdout.splitlines() if l.strip()])
+            lines = [l for l in result.stdout.splitlines() if l.strip()]
+            total_count = len(lines)
+            if total_count > max_beliefs:
+                lines = lines[:max_beliefs]
+            beliefs_text = "\n".join(lines)
+            belief_count = len(lines)
     elif Path("beliefs.md").exists():
         beliefs_text = Path("beliefs.md").read_text()
         belief_count = len(re.findall(r"^### \S+", beliefs_text, re.MULTILINE))
+        total_count = belief_count
 
     if not beliefs_text or belief_count == 0:
         click.echo("No beliefs found. Run the pipeline first:")
@@ -2050,7 +2060,13 @@ def summary(ctx):
         click.echo("  project-expert accept-beliefs")
         sys.exit(1)
 
-    click.echo(f"Summarizing {belief_count} beliefs with {model}...", err=True)
+    if total_count > max_beliefs:
+        click.echo(
+            f"Summarizing top {belief_count} of {total_count} beliefs (by impact) with {model}...",
+            err=True,
+        )
+    else:
+        click.echo(f"Summarizing {belief_count} beliefs with {model}...", err=True)
 
     project_name = config.get("repo", config.get("project", "unknown"))
 
@@ -2060,10 +2076,14 @@ def summary(ctx):
         belief_count=belief_count,
     )
 
+    prompt_size_kb = len(prompt.encode()) / 1024
     try:
         result = asyncio.run(invoke(prompt, model, timeout=timeout))
     except Exception as e:
-        click.echo(f"Error: {e}", err=True)
+        click.echo(
+            f"Error: Model {model} failed (prompt size: {prompt_size_kb:.0f} KB): {e}",
+            err=True,
+        )
         sys.exit(1)
 
     short_name = project_name.split("//")[-1] if "//" in project_name else project_name
