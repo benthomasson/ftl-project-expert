@@ -2437,6 +2437,7 @@ def sprint_plan(ctx, sprint_length, team_size, dry_run, output):
         team_section=team_section,
         backlog_section=backlog_section,
         beliefs_section=beliefs_section,
+        start_date=date.today().isoformat(),
     )
 
     if dry_run:

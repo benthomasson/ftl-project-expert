@@ -9,12 +9,14 @@ def build_sprint_plan_prompt(
     team_section: str,
     backlog_section: str,
     beliefs_section: str,
+    start_date: str = "",
 ) -> str:
+    date_line = f"\n## Sprint start: {start_date}" if start_date else ""
     return f"""You are a senior engineering manager creating a sprint plan grounded in project data and a belief network.
 
 ## Project: {project_name}
 ## Sprint length: {sprint_length}
-## Team size: {team_size}
+## Team size: {team_size}{date_line}
 
 ## Gated Items (blocking the most downstream work)
 
