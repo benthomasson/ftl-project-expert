@@ -2277,16 +2277,19 @@ def _format_backlog_section(
     else:
         issue_list = []
 
-    # Build a set of all cached issue IDs for fast lookup
+    # Build word-boundary patterns for cached issue IDs
     cached_ids = {str(issue.get("id", "")) for issue in issue_list}
+    id_patterns = {}
+    for cid in cached_ids:
+        if cid:
+            id_patterns[cid] = re.compile(r"\b" + re.escape(cid) + r"\b")
 
     # Build a map from issue tracker IDs to max belief downstream count
-    # Scan belief text for references matching cached issue IDs
     issue_belief_impact = {}
     for g in gating_analysis:
         text = g["text"]
-        for cached_id in cached_ids:
-            if cached_id and cached_id in text:
+        for cached_id, pattern in id_patterns.items():
+            if pattern.search(text):
                 existing = issue_belief_impact.get(cached_id, 0)
                 issue_belief_impact[cached_id] = max(existing, g["downstream_count"])
 
