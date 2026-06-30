@@ -164,15 +164,42 @@ def _reasons_export():
 # --- CLI ---
 
 
+def _load_env_file(path, silent=False):
+    """Load KEY=VALUE pairs from a file into os.environ (existing vars take precedence)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[7:].strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError as e:
+        if not silent:
+            click.echo(f"Warning: could not read env file {path}: {e}", err=True)
+
+
 @click.group()
 @click.version_option(package_name="ftl-project-expert")
 @click.option("--quiet", "-q", is_flag=True, default=False,
               help="Suppress output to stdout")
 @click.option("--model", "-m", default="claude", help="Model to use (default: claude)")
 @click.option("--timeout", "-t", default=300, type=int, help="LLM timeout in seconds")
+@click.option("--env-file", default=".env", help="Path to .env file (default: .env)")
 @click.pass_context
-def cli(ctx, quiet, model, timeout):
+def cli(ctx, quiet, model, timeout, env_file):
     """Build expert knowledge bases from project management data."""
+    is_default = ctx.get_parameter_source("env_file") != click.core.ParameterSource.COMMANDLINE
+    _load_env_file(env_file, silent=is_default)
     ctx.ensure_object(dict)
     ctx.obj["quiet"] = quiet
     ctx.obj["model"] = model
