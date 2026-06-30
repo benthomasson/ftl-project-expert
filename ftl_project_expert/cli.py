@@ -1633,7 +1633,21 @@ def _load_network() -> dict:
                 return {"nodes": {}}
         else:
             return {"nodes": {}}
-    return json.loads(network_path.read_text())
+    try:
+        return json.loads(network_path.read_text())
+    except (json.JSONDecodeError, ValueError):
+        click.echo(f"WARN: {network_path} is corrupt or empty, re-exporting", err=True)
+        if _has_reasons():
+            result = subprocess.run(
+                ["reasons", "export", "-o", str(network_path)],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                try:
+                    return json.loads(network_path.read_text())
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        return {"nodes": {}}
 
 
 def _get_depth(node_id: str, nodes: dict, derived: dict, memo: dict | None = None) -> int:
