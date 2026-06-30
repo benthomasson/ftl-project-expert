@@ -167,7 +167,7 @@ def _reasons_export():
 def _load_env_file(path):
     """Load KEY=VALUE pairs from a file into os.environ (existing vars take precedence)."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -176,10 +176,14 @@ def _load_env_file(path):
                     continue
                 key, _, value = line.partition("=")
                 key = key.strip()
-                value = value.strip().strip("'\"")
+                if key.startswith("export "):
+                    key = key[7:].strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
                 if key and key not in os.environ:
                     os.environ[key] = value
-    except FileNotFoundError:
+    except OSError:
         pass
 
 
