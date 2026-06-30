@@ -2028,7 +2028,7 @@ def derive(ctx, output, auto_add, exhaust, max_rounds, dry_run):
 @click.option("--output", "-o", default=None,
               help="Write findings to markdown file")
 @click.pass_context
-def review_beliefs(ctx, auto_retract, sample, min_depth, dry_run, output):
+def review_beliefs(ctx, auto_retract=False, sample=None, min_depth=None, dry_run=False, output=None):
     """Review derived beliefs for validity using LLM evaluation."""
     if not _has_reasons():
         click.echo("Error: reasons CLI required. Install with: uv tool install ftl-reasons", err=True)
@@ -2040,9 +2040,9 @@ def review_beliefs(ctx, auto_retract, sample, min_depth, dry_run, output):
     cmd = ["reasons", "review-beliefs", "-m", model, "--timeout", str(timeout)]
     if auto_retract:
         cmd.append("--auto-retract")
-    if sample:
+    if sample is not None:
         cmd.extend(["--sample", str(sample)])
-    if min_depth:
+    if min_depth is not None:
         cmd.extend(["--min-depth", str(min_depth)])
     if dry_run:
         cmd.append("--dry-run")
@@ -2066,7 +2066,7 @@ def review_beliefs(ctx, auto_retract, sample, min_depth, dry_run, output):
 @click.option("--dry-run", is_flag=True, default=False,
               help="Report findings without applying changes")
 @click.pass_context
-def repair(ctx, review_file, dry_run):
+def repair(ctx, review_file=None, dry_run=False):
     """Repair beliefs flagged by review-beliefs."""
     if not _has_reasons():
         click.echo("Error: reasons CLI required. Install with: uv tool install ftl-reasons", err=True)
