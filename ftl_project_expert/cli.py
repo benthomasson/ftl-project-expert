@@ -1635,8 +1635,8 @@ def _load_network() -> dict:
             return {"nodes": {}}
     try:
         return json.loads(network_path.read_text())
-    except (json.JSONDecodeError, ValueError):
-        click.echo(f"WARN: {network_path} is corrupt or empty, re-exporting", err=True)
+    except (json.JSONDecodeError, ValueError, FileNotFoundError):
+        click.echo(f"WARN: {network_path} is corrupt, empty, or missing, re-exporting", err=True)
         if _has_reasons():
             result = subprocess.run(
                 ["reasons", "export", "-o", str(network_path)],
@@ -1645,7 +1645,7 @@ def _load_network() -> dict:
             if result.returncode == 0:
                 try:
                     return json.loads(network_path.read_text())
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, FileNotFoundError):
                     pass
         return {"nodes": {}}
 
