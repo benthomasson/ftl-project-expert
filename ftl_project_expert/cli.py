@@ -164,7 +164,7 @@ def _reasons_export():
 # --- CLI ---
 
 
-def _load_env_file(path):
+def _load_env_file(path, silent=False):
     """Load KEY=VALUE pairs from a file into os.environ (existing vars take precedence)."""
     try:
         with open(path, encoding="utf-8") as f:
@@ -183,8 +183,9 @@ def _load_env_file(path):
                     value = value[1:-1]
                 if key and key not in os.environ:
                     os.environ[key] = value
-    except OSError:
-        pass
+    except OSError as e:
+        if not silent:
+            click.echo(f"Warning: could not read env file {path}: {e}", err=True)
 
 
 @click.group()
@@ -197,7 +198,8 @@ def _load_env_file(path):
 @click.pass_context
 def cli(ctx, quiet, model, timeout, env_file):
     """Build expert knowledge bases from project management data."""
-    _load_env_file(env_file)
+    is_default = ctx.get_parameter_source("env_file") != click.core.ParameterSource.COMMANDLINE
+    _load_env_file(env_file, silent=is_default)
     ctx.ensure_object(dict)
     ctx.obj["quiet"] = quiet
     ctx.obj["model"] = model
