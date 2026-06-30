@@ -5,12 +5,17 @@ def build_summary_prompt(
     beliefs_text: str,
     project_name: str,
     belief_count: int,
+    total_count: int = 0,
 ) -> str:
     """Build a prompt for summarizing project state from beliefs."""
+    if total_count > belief_count:
+        count_line = f"## Beliefs analyzed: {belief_count} (top by impact out of {total_count} total)"
+    else:
+        count_line = f"## Beliefs analyzed: {belief_count}"
     return f"""You are a senior project manager synthesizing a comprehensive project summary from verified beliefs about a project.
 
 ## Project: {project_name}
-## Beliefs analyzed: {belief_count}
+{count_line}
 
 ## Beliefs
 

@@ -2049,9 +2049,14 @@ def summary(ctx):
             beliefs_text = "\n".join(lines)
             belief_count = len(lines)
     elif Path("beliefs.md").exists():
-        beliefs_text = Path("beliefs.md").read_text()
-        belief_count = len(re.findall(r"^### \S+", beliefs_text, re.MULTILINE))
-        total_count = belief_count
+        full_text = Path("beliefs.md").read_text()
+        sections = re.split(r"(?=^### \S+)", full_text, flags=re.MULTILINE)
+        sections = [s for s in sections if s.strip()]
+        total_count = len(sections)
+        if total_count > max_beliefs:
+            sections = sections[:max_beliefs]
+        beliefs_text = "\n".join(sections)
+        belief_count = len(sections)
 
     if not beliefs_text or belief_count == 0:
         click.echo("No beliefs found. Run the pipeline first:")
@@ -2074,6 +2079,7 @@ def summary(ctx):
         beliefs_text=beliefs_text,
         project_name=project_name,
         belief_count=belief_count,
+        total_count=total_count,
     )
 
     prompt_size_kb = len(prompt.encode()) / 1024
