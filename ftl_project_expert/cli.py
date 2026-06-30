@@ -2035,6 +2035,7 @@ def summary(ctx):
     beliefs_text = ""
     belief_count = 0
     total_count = 0
+    sorted_by_impact = False
 
     if _has_reasons() and Path("reasons.db").exists():
         result = subprocess.run(
@@ -2048,6 +2049,7 @@ def summary(ctx):
                 lines = lines[:max_beliefs]
             beliefs_text = "\n".join(lines)
             belief_count = len(lines)
+            sorted_by_impact = True
     elif Path("beliefs.md").exists():
         full_text = Path("beliefs.md").read_text()
         sections = re.split(r"(?=^### \S+)", full_text, flags=re.MULTILINE)
@@ -2066,8 +2068,9 @@ def summary(ctx):
         sys.exit(1)
 
     if total_count > max_beliefs:
+        order = "by impact" if sorted_by_impact else "by file order"
         click.echo(
-            f"Summarizing top {belief_count} of {total_count} beliefs (by impact) with {model}...",
+            f"Summarizing top {belief_count} of {total_count} beliefs ({order}) with {model}...",
             err=True,
         )
     else:
