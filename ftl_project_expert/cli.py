@@ -2013,6 +2013,82 @@ def derive(ctx, output, auto_add, exhaust, max_rounds, dry_run):
     click.echo("Or re-run with --auto to add automatically.")
 
 
+# --- review-beliefs ---
+
+
+@cli.command("review-beliefs")
+@click.option("--auto-retract", is_flag=True, default=False,
+              help="Automatically retract beliefs found invalid")
+@click.option("--sample", type=int, default=None,
+              help="Randomly sample N beliefs to review")
+@click.option("--min-depth", type=int, default=None,
+              help="Only review beliefs at this depth or deeper")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Report findings without taking action")
+@click.option("--output", "-o", default=None,
+              help="Write findings to markdown file")
+@click.pass_context
+def review_beliefs(ctx, auto_retract=False, sample=None, min_depth=None, dry_run=False, output=None):
+    """Review derived beliefs for validity using LLM evaluation."""
+    if not _has_reasons():
+        click.echo("Error: reasons CLI required. Install with: uv tool install ftl-reasons", err=True)
+        sys.exit(1)
+
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
+    cmd = ["reasons", "review-beliefs", "-m", model, "--timeout", str(timeout)]
+    if auto_retract:
+        cmd.append("--auto-retract")
+    if sample is not None:
+        cmd.extend(["--sample", str(sample)])
+    if min_depth is not None:
+        cmd.extend(["--min-depth", str(min_depth)])
+    if dry_run:
+        cmd.append("--dry-run")
+    if output:
+        cmd.extend(["-o", output])
+
+    click.echo(f"Reviewing beliefs with {model}...", err=True)
+    result = subprocess.run(cmd, text=True)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+    _reasons_export()
+
+
+# --- repair ---
+
+
+@cli.command("repair")
+@click.option("--review-file", default=None,
+              help="Path to review-beliefs JSON report")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Report findings without applying changes")
+@click.pass_context
+def repair(ctx, review_file=None, dry_run=False):
+    """Repair beliefs flagged by review-beliefs."""
+    if not _has_reasons():
+        click.echo("Error: reasons CLI required. Install with: uv tool install ftl-reasons", err=True)
+        sys.exit(1)
+
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
+    cmd = ["reasons", "repair", "-m", model, "--timeout", str(timeout)]
+    if review_file:
+        cmd.extend(["--review-file", review_file])
+    if dry_run:
+        cmd.append("--dry-run")
+
+    click.echo(f"Repairing beliefs with {model}...", err=True)
+    result = subprocess.run(cmd, text=True)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+    _reasons_export()
+
+
 # --- summary ---
 
 
@@ -2578,10 +2654,11 @@ def _load_update_checkpoint(project_dir: str) -> str | None:
               help="Max concurrent LLM calls (default: 1, try 3 for speed)")
 @click.pass_context
 def update(ctx, since, since_last, state, limit, all_pages, max_explore, max_parallel):
-    """Automated update pipeline: scan, explore, extract beliefs, derive, summarize.
+    """Automated update pipeline: scan, explore, extract beliefs, derive, review, repair, summarize.
 
     Pulls all issues/PRs updated since a date, explores them, proposes and
-    accepts beliefs, derives logical consequences, and generates a summary.
+    accepts beliefs, derives logical consequences, reviews and repairs
+    derived beliefs, and generates a summary.
 
     Examples:
         project-expert update --since 2026-04-01
@@ -2748,9 +2825,39 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore, max_par
         errors.append(f"derive: {e}")
         click.echo(f"WARN: derive failed: {e}, continuing...", err=True)
 
-    # --- Step 7: Summary ---
+    # --- Step 7: Review beliefs ---
     click.echo(f"\n{'=' * 40}", err=True)
-    click.echo("Step 7: Generating summary", err=True)
+    click.echo("Step 7: Reviewing derived beliefs", err=True)
+    click.echo(f"{'=' * 40}", err=True)
+
+    try:
+        ctx.invoke(review_beliefs, auto_retract=True)
+    except SystemExit as e:
+        if e.code and e.code != 0:
+            errors.append(f"review-beliefs exited with code {e.code}")
+            click.echo(f"WARN: review-beliefs failed (exit {e.code}), continuing...", err=True)
+    except Exception as e:
+        errors.append(f"review-beliefs: {e}")
+        click.echo(f"WARN: review-beliefs failed: {e}, continuing...", err=True)
+
+    # --- Step 8: Repair ---
+    click.echo(f"\n{'=' * 40}", err=True)
+    click.echo("Step 8: Repairing flagged beliefs", err=True)
+    click.echo(f"{'=' * 40}", err=True)
+
+    try:
+        ctx.invoke(repair)
+    except SystemExit as e:
+        if e.code and e.code != 0:
+            errors.append(f"repair exited with code {e.code}")
+            click.echo(f"WARN: repair failed (exit {e.code}), continuing...", err=True)
+    except Exception as e:
+        errors.append(f"repair: {e}")
+        click.echo(f"WARN: repair failed: {e}, continuing...", err=True)
+
+    # --- Step 9: Summary ---
+    click.echo(f"\n{'=' * 40}", err=True)
+    click.echo("Step 9: Generating summary", err=True)
     click.echo(f"{'=' * 40}", err=True)
 
     try:
