@@ -4,6 +4,7 @@ from .scan import build_scan_prompt
 from .explore import build_explore_prompt
 from .propose import PROPOSE_BELIEFS_PROJECT
 from .research import RESEARCH_PROMPT
+from .sprint_plan import build_sprint_plan_prompt
 from .summary import build_summary_prompt
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "build_explore_prompt",
     "PROPOSE_BELIEFS_PROJECT",
     "RESEARCH_PROMPT",
+    "build_sprint_plan_prompt",
     "build_summary_prompt",
 ]

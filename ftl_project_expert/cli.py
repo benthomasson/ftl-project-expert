@@ -18,6 +18,7 @@ from .prompts import (
     RESEARCH_PROMPT,
     build_explore_prompt,
     build_scan_prompt,
+    build_sprint_plan_prompt,
     build_summary_prompt,
 )
 from .sources import GitHubSource, GitLabSource, Issue, JiraSource
@@ -458,6 +459,7 @@ def _cache_issues(issues: list[Issue], project_dir: str) -> None:
             "author": issue.author,
             "created": issue.created,
             "updated": issue.updated,
+            "closed": issue.closed,
             "comment_count": issue.comment_count,
         }
     os.makedirs(project_dir, exist_ok=True)
@@ -2099,6 +2101,372 @@ def summary(ctx):
     short_name = project_name.split("//")[-1] if "//" in project_name else project_name
     safe_name = short_name.replace("/", "-")
     _create_entry(f"summary-{safe_name}", f"Summary: {project_name}", result)
+
+    _emit(ctx, result)
+
+
+# --- sprint-plan ---
+
+
+def _compute_gating_analysis(network: dict) -> list[dict]:
+    """Compute which nodes gate the most downstream work."""
+    from collections import defaultdict, deque
+
+    nodes = network.get("nodes", {})
+    if not nodes:
+        return []
+
+    dependents_map = defaultdict(set)
+    outlist_gates = defaultdict(set)
+    for k, v in nodes.items():
+        for j in v.get("justifications", []):
+            for a in j.get("antecedents", []):
+                dependents_map[a].add(k)
+            for o in j.get("outlist", []):
+                dependents_map[o].add(k)
+                outlist_gates[o].add(k)
+
+    def _transitive_count(node_id: str) -> int:
+        visited = set()
+        queue = deque([node_id])
+        while queue:
+            current = queue.popleft()
+            if current in visited:
+                continue
+            visited.add(current)
+            for dep in dependents_map.get(current, []):
+                if dep not in visited:
+                    queue.append(dep)
+        return len(visited) - 1
+
+    results = []
+    for node_id in dependents_map:
+        if node_id not in nodes:
+            continue
+        node = nodes[node_id]
+        downstream = _transitive_count(node_id)
+        if downstream == 0:
+            continue
+        results.append({
+            "id": node_id,
+            "text": node.get("text", ""),
+            "truth_value": node.get("truth_value", "?"),
+            "downstream_count": downstream,
+            "gated_conclusions": list(outlist_gates.get(node_id, [])),
+        })
+
+    results.sort(key=lambda x: x["downstream_count"], reverse=True)
+    return results
+
+
+def _compute_team_signals(cached_issues: dict) -> dict:
+    """Infer team composition and capacity from cached issues."""
+    from collections import defaultdict
+
+    team = defaultdict(lambda: {
+        "open": 0, "closed_recent": 0, "total": 0,
+        "priorities": defaultdict(int),
+    })
+    total_open = 0
+    unassigned_open = 0
+    now = datetime.now()
+
+    issues = cached_issues.get("issues", cached_issues)
+    if isinstance(issues, dict):
+        issue_list = list(issues.values()) if issues else []
+    elif isinstance(issues, list):
+        issue_list = issues
+    else:
+        issue_list = []
+
+    for issue in issue_list:
+        state = (issue.get("state") or "").lower()
+        assignees = issue.get("assignees") or []
+        priority = issue.get("priority") or "none"
+        is_open = state in ("open", "opened", "to do", "in progress", "new")
+
+        if is_open:
+            total_open += 1
+
+        if not assignees and is_open:
+            unassigned_open += 1
+
+        is_recent_close = False
+        if not is_open:
+            closed_str = issue.get("closed") or issue.get("updated") or ""
+            if closed_str:
+                try:
+                    closed_dt = datetime.fromisoformat(closed_str.replace("Z", "+00:00"))
+                    is_recent_close = (now - closed_dt.replace(tzinfo=None)).days <= 30
+                except (ValueError, TypeError):
+                    pass
+
+        for assignee in assignees:
+            name = assignee if isinstance(assignee, str) else assignee.get("login", assignee.get("name", "unknown"))
+            team[name]["total"] += 1
+            if is_open:
+                team[name]["open"] += 1
+            if is_recent_close:
+                team[name]["closed_recent"] += 1
+            team[name]["priorities"][priority] += 1
+
+    members = []
+    for name, data in sorted(team.items(), key=lambda x: x[1]["open"], reverse=True):
+        members.append({
+            "name": name,
+            "open_issues": data["open"],
+            "closed_recent": data["closed_recent"],
+            "total": data["total"],
+            "priorities": dict(data["priorities"]),
+        })
+
+    return {
+        "team_members": members,
+        "inferred_team_size": len(members),
+        "total_open": total_open,
+        "unassigned_open": unassigned_open,
+    }
+
+
+def _format_gating_section(gating_analysis: list[dict], max_items: int = 30) -> str:
+    if not gating_analysis:
+        return "No gating analysis available."
+    lines = []
+    for item in gating_analysis[:max_items]:
+        gated = ", ".join(item["gated_conclusions"][:5]) if item["gated_conclusions"] else "indirect"
+        lines.append(
+            f"- `{item['id']}` [{item['truth_value']}] "
+            f"(downstream: {item['downstream_count']}) — {item['text'][:120]}"
+        )
+        if item["gated_conclusions"]:
+            lines.append(f"  Gates: {gated}")
+    total = len(gating_analysis)
+    if total > max_items:
+        lines.append(f"\n({total - max_items} more gating nodes omitted)")
+    return "\n".join(lines)
+
+
+def _format_team_section(team_signals: dict) -> str:
+    if not team_signals["team_members"]:
+        return "No team data available (no assignees found in issues)."
+    lines = [
+        f"Total open issues: {team_signals['total_open']} "
+        f"({team_signals['unassigned_open']} unassigned)",
+        "",
+    ]
+    for m in team_signals["team_members"]:
+        prio_str = ", ".join(f"{k}: {v}" for k, v in m["priorities"].items() if k != "none")
+        lines.append(
+            f"- **{m['name']}**: {m['open_issues']} open, "
+            f"{m['closed_recent']} closed (last 30d)"
+            + (f" | priorities: {prio_str}" if prio_str else "")
+        )
+    return "\n".join(lines)
+
+
+def _format_backlog_section(
+    cached_issues: dict,
+    gating_analysis: list[dict],
+    max_items: int = 40,
+) -> str:
+    issues = cached_issues.get("issues", cached_issues)
+    if isinstance(issues, dict):
+        issue_list = list(issues.values()) if issues else []
+    elif isinstance(issues, list):
+        issue_list = issues
+    else:
+        issue_list = []
+
+    # Build word-boundary patterns for cached issue IDs
+    cached_ids = {str(issue.get("id", "")) for issue in issue_list}
+    id_patterns = {}
+    for cid in cached_ids:
+        if cid:
+            id_patterns[cid] = re.compile(r"\b" + re.escape(cid) + r"\b")
+
+    # Build a map from issue tracker IDs to max belief downstream count
+    issue_belief_impact = {}
+    for g in gating_analysis:
+        text = g["text"]
+        for cached_id, pattern in id_patterns.items():
+            if pattern.search(text):
+                existing = issue_belief_impact.get(cached_id, 0)
+                issue_belief_impact[cached_id] = max(existing, g["downstream_count"])
+
+    priority_order = {"critical": 0, "highest": 1, "high": 2, "medium": 3, "low": 4}
+
+    open_issues = []
+    for issue in issue_list:
+        state = (issue.get("state") or "").lower()
+        if state not in ("open", "opened", "to do", "in progress", "new"):
+            continue
+
+        issue_id = str(issue.get("id", ""))
+        belief_impact = issue_belief_impact.get(issue_id, 0)
+
+        prio = (issue.get("priority") or "medium").lower()
+        prio_rank = priority_order.get(prio, 3)
+
+        open_issues.append({
+            "issue": issue,
+            "priority_rank": prio_rank,
+            "belief_impact": belief_impact,
+        })
+
+    open_issues.sort(key=lambda x: (-x["belief_impact"], x["priority_rank"]))
+
+    if not open_issues:
+        return "No open issues found in cache."
+
+    lines = []
+    for item in open_issues[:max_items]:
+        issue = item["issue"]
+        assignees = issue.get("assignees") or []
+        assignee_str = ", ".join(assignees) if assignees else "unassigned"
+        prio = issue.get("priority") or "—"
+        title = (issue.get("title") or "")[:100]
+        issue_id = issue.get("id", "?")
+        milestone = issue.get("milestone") or ""
+        updated = (issue.get("updated") or "")[:10]
+        impact = item["belief_impact"]
+
+        line = f"- **{issue_id}**: {title}"
+        line += f"\n  Priority: {prio} | Assignee: {assignee_str} | Updated: {updated}"
+        if impact > 0:
+            line += f" | Belief impact: {impact} downstream"
+        if milestone:
+            line += f" | Milestone: {milestone}"
+        lines.append(line)
+
+    total = len(open_issues)
+    if total > max_items:
+        lines.append(f"\n({total - max_items} more open issues omitted)")
+    return "\n".join(lines)
+
+
+@cli.command("sprint-plan")
+@click.option("--sprint-length", default="2w",
+              help="Sprint length (e.g. 1w, 2w, 3w)")
+@click.option("--team-size", type=int, default=None,
+              help="Override team size (default: inferred from issue data)")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Show data that would be sent to the LLM without invoking it")
+@click.option("--output", "-o", default=None,
+              help="Write output to file instead of stdout")
+@click.pass_context
+def sprint_plan(ctx, sprint_length, team_size, dry_run, output):
+    """Generate a prioritized sprint plan from beliefs and issues."""
+    config = _load_config()
+    if not config:
+        click.echo("Not initialized. Run: project-expert init <platform> <target>")
+        sys.exit(1)
+
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
+    if not dry_run and not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
+    # Load network and compute gating analysis
+    network = _load_network()
+    nodes = network.get("nodes", {})
+    gating_analysis = _compute_gating_analysis(network) if nodes else []
+
+    if gating_analysis:
+        click.echo(
+            f"Gating analysis: {len(gating_analysis)} nodes with downstream impact",
+            err=True,
+        )
+    else:
+        click.echo("WARN: No belief network available for gating analysis", err=True)
+
+    # Load cached issues and compute team signals
+    project_dir = _get_project_dir()
+    cached_issues = _load_cached_issues(project_dir)
+    team_signals = _compute_team_signals(cached_issues) if cached_issues else {
+        "team_members": [], "inferred_team_size": 0,
+        "total_open": 0, "unassigned_open": 0,
+    }
+
+    if cached_issues:
+        click.echo(
+            f"Issues: {team_signals['total_open']} open "
+            f"({team_signals['unassigned_open']} unassigned), "
+            f"{team_signals['inferred_team_size']} team members detected",
+            err=True,
+        )
+    else:
+        click.echo("WARN: No cached issues. Run: project-expert scan", err=True)
+
+    effective_team_size = team_size or team_signals["inferred_team_size"] or 3
+
+    # Load top beliefs by impact
+    beliefs_section = ""
+    max_beliefs = 100
+    if _has_reasons() and Path("reasons.db").exists():
+        result = subprocess.run(
+            ["reasons", "list", "--status", "IN", "--by-impact"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = [l for l in result.stdout.splitlines() if l.strip()]
+            beliefs_section = "\n".join(lines[:max_beliefs])
+            click.echo(f"Beliefs: using top {min(len(lines), max_beliefs)} of {len(lines)} IN beliefs", err=True)
+    if not beliefs_section and Path("beliefs.md").exists():
+        full_text = Path("beliefs.md").read_text()
+        sections = re.split(r"(?=^### \S+)", full_text, flags=re.MULTILINE)
+        sections = [s for s in sections if s.strip().startswith("###")]
+        beliefs_section = "\n".join(sections[:max_beliefs])
+
+    if not beliefs_section:
+        beliefs_section = "No beliefs available."
+
+    # Build prompt sections
+    gating_section = _format_gating_section(gating_analysis)
+    team_section = _format_team_section(team_signals)
+    backlog_section = _format_backlog_section(cached_issues, gating_analysis)
+
+    project_name = config.get("repo", config.get("project", "unknown"))
+
+    prompt = build_sprint_plan_prompt(
+        project_name=project_name,
+        sprint_length=sprint_length,
+        team_size=effective_team_size,
+        gating_section=gating_section,
+        team_section=team_section,
+        backlog_section=backlog_section,
+        beliefs_section=beliefs_section,
+        start_date=date.today().isoformat(),
+    )
+
+    if dry_run:
+        prompt_size_kb = len(prompt.encode()) / 1024
+        click.echo(f"\n=== Sprint Plan Prompt ({prompt_size_kb:.0f} KB) ===\n")
+        click.echo(prompt[:5000])
+        if len(prompt) > 5000:
+            click.echo(f"\n... ({len(prompt) - 5000} more chars)")
+        return
+
+    click.echo(f"Generating sprint plan with {model}...", err=True)
+
+    prompt_size_kb = len(prompt.encode()) / 1024
+    try:
+        result = asyncio.run(invoke(prompt, model, timeout=timeout))
+    except Exception as e:
+        click.echo(
+            f"Error: Model {model} failed (prompt size: {prompt_size_kb:.0f} KB): {e}",
+            err=True,
+        )
+        sys.exit(1)
+
+    short_name = project_name.split("//")[-1] if "//" in project_name else project_name
+    safe_name = short_name.replace("/", "-")
+    _create_entry(f"sprint-plan-{safe_name}", f"Sprint Plan: {project_name} ({sprint_length})", result)
+
+    if output:
+        Path(output).write_text(result)
+        click.echo(f"Wrote sprint plan to {output}", err=True)
 
     _emit(ctx, result)
 
