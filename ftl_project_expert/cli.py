@@ -459,6 +459,7 @@ def _cache_issues(issues: list[Issue], project_dir: str) -> None:
             "author": issue.author,
             "created": issue.created,
             "updated": issue.updated,
+            "closed": issue.closed,
             "comment_count": issue.comment_count,
         }
     os.makedirs(project_dir, exist_ok=True)
@@ -2276,19 +2277,18 @@ def _format_backlog_section(
     else:
         issue_list = []
 
+    # Build a set of all cached issue IDs for fast lookup
+    cached_ids = {str(issue.get("id", "")) for issue in issue_list}
+
     # Build a map from issue tracker IDs to max belief downstream count
+    # Scan belief text for references matching cached issue IDs
     issue_belief_impact = {}
     for g in gating_analysis:
-        for ref in _extract_issue_refs(g["text"]):
-            if "key" in ref:
-                ref_keys = [ref["key"]]
-            elif "number" in ref:
-                ref_keys = [f"GH-{ref['number']}", f"GL-{ref['number']}"]
-            else:
-                continue
-            for ref_key in ref_keys:
-                existing = issue_belief_impact.get(ref_key, 0)
-                issue_belief_impact[ref_key] = max(existing, g["downstream_count"])
+        text = g["text"]
+        for cached_id in cached_ids:
+            if cached_id and cached_id in text:
+                existing = issue_belief_impact.get(cached_id, 0)
+                issue_belief_impact[cached_id] = max(existing, g["downstream_count"])
 
     priority_order = {"critical": 0, "highest": 1, "high": 2, "medium": 3, "low": 4}
 
