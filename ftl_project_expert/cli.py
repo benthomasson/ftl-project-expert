@@ -193,7 +193,7 @@ def _load_env_file(path, silent=False):
 @click.option("--quiet", "-q", is_flag=True, default=False,
               help="Suppress output to stdout")
 @click.option("--model", "-m", default="claude", help="Model to use (default: claude)")
-@click.option("--timeout", "-t", default=300, type=int, help="LLM timeout in seconds")
+@click.option("--timeout", "-t", default=600, type=int, help="LLM timeout in seconds")
 @click.option("--env-file", default=".env", help="Path to .env file (default: .env)")
 @click.pass_context
 def cli(ctx, quiet, model, timeout, env_file):
