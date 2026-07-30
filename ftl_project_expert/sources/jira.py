@@ -84,7 +84,11 @@ class JiraSource:
             since: Fetch issues updated on or after this date (YYYY-MM-DD).
         """
         if jql is None:
-            parts = [f'project = "{self.project}"']
+            if "," in self.project:
+                projects = ", ".join(p.strip() for p in self.project.split(","))
+                parts = [f"project in ({projects})"]
+            else:
+                parts = [f'project = "{self.project}"']
             if state and state.lower() != "all":
                 if state.lower() in ("open", "opened"):
                     parts.append('statusCategory != "Done"')
