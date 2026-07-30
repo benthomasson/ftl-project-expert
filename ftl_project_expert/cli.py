@@ -2763,7 +2763,7 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore, max_par
                                state, limit, 1, project_dir, model, timeout)
 
         if total_issues == 0:
-            click.echo("No issues found since {since}.", err=True)
+            click.echo(f"No issues found since {since}.", err=True)
         else:
             click.echo(f"Scanned {total_issues} issue(s).", err=True)
 
