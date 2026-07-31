@@ -12,7 +12,14 @@ from pathlib import Path
 
 import click
 
-from .llm import check_model_available, invoke, invoke_concurrent_sync, invoke_sync
+from .llm import (
+    check_model_available,
+    format_cost_summary,
+    invoke,
+    invoke_concurrent_sync,
+    invoke_sync,
+    reset_cost_tracker,
+)
 from .prompts import (
     PROPOSE_BELIEFS_PROJECT,
     RESEARCH_PROMPT,
@@ -82,6 +89,12 @@ def _get_source(config: dict) -> GitHubSource | GitLabSource | JiraSource:
 def _emit(ctx, text: str) -> None:
     if not ctx.obj.get("quiet"):
         click.echo(text)
+
+
+def _emit_cost() -> None:
+    cost = format_cost_summary()
+    if cost:
+        click.echo(f"  {cost}", err=True)
 
 
 def _create_entry(topic: str, title: str, content: str) -> None:
@@ -371,6 +384,7 @@ def scan(ctx, state, labels, limit, page, all_pages, jql, per_issue):
             ctx, config, source, model, timeout, project_dir,
             state, label_list, limit, page, jql, per_issue,
         )
+    _emit_cost()
 
 
 def _scan_page(ctx, config, source, model, timeout, project_dir,
@@ -648,6 +662,7 @@ def explore(ctx, do_skip, pick_index, loop_max, max_parallel):
         click.echo(f"\n{remaining} topic(s) remaining.", err=True)
     else:
         click.echo("\nNo more topics. Exploration complete.", err=True)
+    _emit_cost()
 
 
 def _explore_loop(ctx, project_dir, max_topics, max_parallel=1):
@@ -1000,6 +1015,7 @@ def propose_beliefs(ctx, batch_size, output, process_all, auto_accept, since, ma
 
     click.echo(f"\nWrote {output_path}")
     click.echo("Review the file, then run: project-expert accept-beliefs")
+    _emit_cost()
 
 
 # --- accept-beliefs ---
@@ -1355,6 +1371,7 @@ def review_proposals(ctx, proposals_file, batch_size, max_parallel):
         click.echo(f"Updated {proposals_file}", err=True)
     else:
         click.echo("No changes needed.", err=True)
+    _emit_cost()
 
 
 # --- research ---
@@ -1672,6 +1689,7 @@ def research(ctx, belief_id, negative, high_impact, select_limit, max_parallel):
         _create_entry(f"research-{safe_id}", f"Research: {bid} [{verdict}]", result)
 
         _emit(ctx, result)
+    _emit_cost()
 
 
 # --- derive ---
@@ -2038,6 +2056,7 @@ def derive(ctx, output, auto_add, exhaust, max_rounds, dry_run):
     click.echo(f"\nWrote {output_path} ({len(valid)} proposals)")
     click.echo("Review, then run the commands from the file to accept.")
     click.echo("Or re-run with --auto to add automatically.")
+    _emit_cost()
 
 
 # --- review-beliefs ---
@@ -2206,6 +2225,7 @@ def summary(ctx):
     _create_entry(f"summary-{safe_name}", f"Summary: {project_name}", result)
 
     _emit(ctx, result)
+    _emit_cost()
 
 
 # --- sprint-plan ---
@@ -2572,6 +2592,7 @@ def sprint_plan(ctx, sprint_length, team_size, dry_run, output):
         click.echo(f"Wrote sprint plan to {output}", err=True)
 
     _emit(ctx, result)
+    _emit_cost()
 
 
 # --- status ---
@@ -2692,6 +2713,7 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore, max_par
         project-expert update --since-last
         project-expert update --since "2026-04-01" --all-pages
     """
+    reset_cost_tracker()
     config = _load_config()
     if not config:
         click.echo("Not initialized. Run: project-expert init <platform> <target>")
@@ -2926,6 +2948,7 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore, max_par
             click.echo(f"  - {err}", err=True)
     else:
         click.echo("Update completed successfully.", err=True)
+    _emit_cost()
     click.echo(f"{'=' * 40}", err=True)
 
 
