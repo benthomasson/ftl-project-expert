@@ -46,7 +46,8 @@ async def invoke(prompt: str, model: str = "claude", timeout: int = DEFAULT_TIME
         raise TimeoutError(f"Model {model} timed out after {timeout}s") from None
 
     if proc.returncode != 0:
-        raise RuntimeError(f"Model {model} failed: {stderr.decode()}")
+        detail = stderr.decode().strip() or stdout.decode().strip() or f"exit code {proc.returncode}"
+        raise RuntimeError(f"Model {model} failed: {detail}")
 
     return stdout.decode()
 
