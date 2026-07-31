@@ -2872,8 +2872,16 @@ def update(ctx, since, since_last, state, limit, all_pages, max_explore, max_par
     click.echo("Step 8: Repairing flagged beliefs", err=True)
     click.echo(f"{'=' * 40}", err=True)
 
+    review_file = None
+    reviews_dir = Path("reviews")
+    if reviews_dir.is_dir():
+        reports = sorted(reviews_dir.glob("review-beliefs-*.json"))
+        if reports:
+            review_file = str(reports[-1])
+            click.echo(f"  Using review report: {review_file}", err=True)
+
     try:
-        ctx.invoke(repair)
+        ctx.invoke(repair, review_file=review_file)
     except SystemExit as e:
         if e.code and e.code != 0:
             errors.append(f"repair exited with code {e.code}")
